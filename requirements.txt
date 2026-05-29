@@ -1,0 +1,6 @@
+arch>=5.0
+numpy
+pandas
+scipy
+matplotlib
+yfinance
