@@ -4,3 +4,6 @@ pandas
 scipy
 matplotlib
 yfinance
+xgboost>=2.0
+scikit-learn>=1.0
+optuna>=3.0
