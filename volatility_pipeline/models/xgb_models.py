@@ -17,11 +17,29 @@ _DEFAULT_XGB_PARAMS: dict = {
     "reg_lambda":       1.0,
     "objective":        "reg:squarederror",
     "verbosity":        0,
+    # n_jobs=1: intentionally single-threaded by default so that model-level
+    # process parallelism (RollingEvaluator n_jobs > 1) does not cause
+    # oversubscription.  Set to -1 when evaluating a single model sequentially.
+    "n_jobs":           1,
 }
 
 
-def _optuna_tune(X: np.ndarray, y: np.ndarray, n_trials: int, seed: int) -> dict:
-    """Tune XGBRegressor via Optuna on an 80/20 time-series holdout split."""
+def _optuna_tune(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_trials: int,
+    seed: int,
+    n_jobs: int = 1,
+) -> dict:
+    """
+    Tune XGBRegressor via Optuna on an 80/20 time-series holdout split.
+
+    Parameters
+    ----------
+    n_jobs : parallel Optuna workers (n_jobs=1 → sequential trials).
+             Set > 1 only when running a single model; keep at 1 when the
+             caller is already inside a model-level process pool.
+    """
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -41,6 +59,7 @@ def _optuna_tune(X: np.ndarray, y: np.ndarray, n_trials: int, seed: int) -> dict
             "reg_lambda":       trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
             "objective":        "reg:squarederror",
             "verbosity":        0,
+            "n_jobs":           1,   # always 1 inside trials; outer n_jobs handles concurrency
             "random_state":     seed,
         }
         m = xgb.XGBRegressor(**p)
@@ -51,7 +70,7 @@ def _optuna_tune(X: np.ndarray, y: np.ndarray, n_trials: int, seed: int) -> dict
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=seed),
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=False)
     best = study.best_params
     best["objective"] = "reg:squarederror"
     return best
@@ -72,15 +91,17 @@ class XGBVolatilityModel:
         use_returns: bool = True,
         use_optuna: bool = False,
         n_trials: int = 50,
+        optuna_n_jobs: int = 1,
         xgb_params: dict | None = None,
         seed: int = 42,
     ) -> None:
-        self.n_lags       = n_lags
-        self.use_returns  = use_returns
-        self.use_optuna   = use_optuna
-        self.n_trials     = n_trials
-        self.xgb_params   = dict(xgb_params or _DEFAULT_XGB_PARAMS)
-        self.seed         = seed
+        self.n_lags        = n_lags
+        self.use_returns   = use_returns
+        self.use_optuna    = use_optuna
+        self.n_trials      = n_trials
+        self.optuna_n_jobs = optuna_n_jobs
+        self.xgb_params    = dict(xgb_params or _DEFAULT_XGB_PARAMS)
+        self.seed          = seed
         self._model: xgb.XGBRegressor | None = None
         self._last_sq: np.ndarray | None = None
         self._last_r:  np.ndarray | None = None
@@ -90,7 +111,7 @@ class XGBVolatilityModel:
         sq = r ** 2
         X, y = self._build_features(sq, r)
         params = (
-            _optuna_tune(X, y, self.n_trials, self.seed)
+            _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs)
             if self.use_optuna
             else {**self.xgb_params, "random_state": self.seed, "verbosity": 0}
         )
@@ -163,6 +184,7 @@ class XGBHybridModel:
         use_returns: bool = True,
         use_optuna: bool = False,
         n_trials: int = 50,
+        optuna_n_jobs: int = 1,
         xgb_params: dict | None = None,
         seed: int = 42,
     ) -> None:
@@ -177,6 +199,7 @@ class XGBHybridModel:
         self.use_returns      = use_returns
         self.use_optuna       = use_optuna
         self.n_trials         = n_trials
+        self.optuna_n_jobs    = optuna_n_jobs
         self.xgb_params       = dict(xgb_params or _DEFAULT_XGB_PARAMS)
         self.seed             = seed
         self._garch: GARCHModel | None       = None
@@ -213,7 +236,7 @@ class XGBHybridModel:
         y = np.array(targets, dtype=float)
 
         params = (
-            _optuna_tune(X, y, self.n_trials, self.seed)
+            _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs)
             if self.use_optuna
             else {**self.xgb_params, "random_state": self.seed, "verbosity": 0}
         )

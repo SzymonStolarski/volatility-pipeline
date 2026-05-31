@@ -1,9 +1,26 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Literal
+import multiprocessing
 import numpy as np
 import pandas as pd
 from .metrics import metrics_summary, compute_loss
+
+
+# ---------------------------------------------------------------------------
+# Module-level helper required for pickling in ProcessPoolExecutor / joblib.
+# Must NOT be a lambda or a nested function.
+# ---------------------------------------------------------------------------
+
+def _evaluate_spec(
+    evaluator: "RollingEvaluator",
+    factory: Callable,
+    name: str,
+    train_returns: pd.Series,
+    test_returns: pd.Series,
+) -> tuple[str, "ForecastResult"]:
+    """Worker function for parallel evaluation of a single model spec."""
+    return name, evaluator.evaluate(factory, name, train_returns, test_returns, verbose=False)
 
 
 @dataclass
@@ -130,19 +147,64 @@ class RollingEvaluator:
         train_returns: pd.Series,
         test_returns: pd.Series,
         verbose: bool = True,
+        n_jobs: int = 1,
     ) -> dict[str, ForecastResult]:
         """
-        Evaluate multiple models in sequence.
+        Evaluate multiple models, optionally in parallel.
 
         Parameters
         ----------
-        specs : list of (factory_callable, name) tuples
+        specs   : list of (factory_callable, name) tuples.
+                  For parallel execution (n_jobs != 1) factory callables MUST be
+                  picklable.  Use ``functools.partial`` instead of ``lambda``.
+        n_jobs  : number of parallel worker processes.
+                  1  → sequential (default, safe with any factory).
+                  -1 → use all available CPU cores.
+                  N  → use N worker processes.
+
+        Notes
+        -----
+        When n_jobs != 1 each model runs in a separate process via
+        ``concurrent.futures.ProcessPoolExecutor``.  Results are returned in
+        the same order as *specs* regardless of completion order.
+        Verbose per-step output is suppressed in workers; a single summary
+        line is printed per model once it completes.
         """
-        results: dict[str, ForecastResult] = {}
-        for factory, name in specs:
-            if verbose:
-                print(f"Evaluating {name}...")
-            results[name] = self.evaluate(
-                factory, name, train_returns, test_returns, verbose=verbose
+        if n_jobs == 1:
+            results: dict[str, ForecastResult] = {}
+            for factory, name in specs:
+                if verbose:
+                    print(f"Evaluating {name}...")
+                results[name] = self.evaluate(
+                    factory, name, train_returns, test_returns, verbose=verbose
+                )
+            return results
+
+        # ------------------------------------------------------------------
+        # Parallel path
+        # ------------------------------------------------------------------
+        workers = multiprocessing.cpu_count() if n_jobs == -1 else n_jobs
+        if verbose:
+            print(
+                f"Parallel evaluation: {len(specs)} models "
+                f"on {workers} worker process(es)..."
             )
-        return results
+
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        results: dict[str, ForecastResult] = {}
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_name = {
+                executor.submit(_evaluate_spec, self, factory, name,
+                                train_returns, test_returns): name
+                for factory, name in specs
+            }
+            for future in as_completed(future_to_name):
+                name, result = future.result()
+                results[name] = result
+                if verbose:
+                    m = result.metrics()
+                    print(f"  [{name}] done  RMSE={m['RMSE']:.4e}")
+
+        # Preserve original spec order
+        return {name: results[name] for _, name in specs if name in results}
