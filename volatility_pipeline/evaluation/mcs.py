@@ -123,6 +123,49 @@ def mcs(
     )
 
 
+def arch_mcs(
+    results: dict,
+    loss: str = "qlike",
+    size: float = 0.10,
+    n_boot: int = 2000,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Cross-check MCS using Kevin Sheppard's arch.bootstrap.MCS (T_max statistic).
+
+    Run this alongside mcs() to distinguish implementation bugs from substantive
+    results.  If both implementations retain the full model set, the issue is a
+    noisy proxy (squared returns), not a code error.
+
+    Returns a DataFrame with mcs_pvalue and in_mcs columns, compatible with
+    MCSResult.summary() for direct side-by-side comparison.
+
+    Parameters
+    ----------
+    results : dict mapping model name → ForecastResult
+    loss    : loss function ('squared', 'absolute', 'qlike')
+    size    : significance level (alpha)
+    n_boot  : bootstrap replications
+    seed    : random seed
+    """
+    from arch.bootstrap import MCS as ArchMCS
+
+    names = list(results.keys())
+    losses_df = pd.DataFrame(
+        {n: results[n].loss_series(loss).values for n in names}
+    )
+
+    mcs_obj = ArchMCS(losses_df, size=size, reps=n_boot, method="max", seed=seed)
+    mcs_obj.compute()
+
+    pv = mcs_obj.pvalues
+    if isinstance(pv, pd.DataFrame):
+        pv = pv.iloc[:, 0]
+    df = pd.DataFrame({"mcs_pvalue": pv})
+    df["in_mcs"] = df["mcs_pvalue"] > size
+    return df.sort_values("mcs_pvalue", ascending=False)
+
+
 def _stationary_bootstrap_means(
     data: np.ndarray,
     block_size: int,

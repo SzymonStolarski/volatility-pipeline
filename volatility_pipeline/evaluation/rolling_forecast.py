@@ -11,8 +11,9 @@ class ForecastResult:
     """Out-of-sample forecast results for a single model."""
     name: str
     forecasts: pd.Series          # one-step-ahead conditional variance forecasts
-    actuals: pd.Series            # realized variance proxy (squared log-returns)
+    actuals: pd.Series            # realized variance proxy
     refit_indices: list[int] = field(default_factory=list)
+    proxy: str = "squared_returns"  # name of the variance proxy used
 
     @property
     def errors(self) -> pd.Series:
@@ -35,7 +36,7 @@ class ForecastResult:
         m = self.metrics()
         return (
             f"ForecastResult(name={self.name!r}, n={len(self.forecasts)}, "
-            f"RMSE={m['RMSE']:.6e})"
+            f"proxy={self.proxy!r}, RMSE={m['RMSE']:.6e})"
         )
 
 
@@ -73,6 +74,7 @@ class RollingEvaluator:
         name: str,
         train_returns: pd.Series,
         test_returns: pd.Series,
+        actuals_series: pd.Series | None = None,
         verbose: bool = False,
     ) -> ForecastResult:
         """
@@ -80,12 +82,15 @@ class RollingEvaluator:
 
         Parameters
         ----------
-        model_factory : callable() -> model with .fit(returns) and .forecast_variance(horizon)
-        name          : display label for this model
-        train_returns : initial training window (log returns as pd.Series);
-                        also sets the fixed window length when window_type="sliding"
-        test_returns  : evaluation period (log returns as pd.Series)
-        verbose       : print a line each time the model is re-fitted
+        model_factory  : callable() -> model with .fit(returns) and .forecast_variance(horizon)
+        name           : display label for this model
+        train_returns  : initial training window (log returns as pd.Series);
+                         also sets the fixed window length when window_type="sliding"
+        test_returns   : evaluation period (log returns as pd.Series)
+        actuals_series : pre-computed variance proxy aligned to test_returns.index
+                         (e.g., Garman-Klass or Parkinson series).  If None,
+                         falls back to squared log-returns.
+        verbose        : print a line each time the model is re-fitted
         """
         all_returns = pd.concat([train_returns, test_returns])
         n_train = len(train_returns)
@@ -115,13 +120,19 @@ class RollingEvaluator:
             fc = model.forecast_variance(horizon=self.n_ahead)
             forecasts[i] = float(fc[0])
 
-        actuals = test_returns.values ** 2  # squared log-returns as variance proxy
+        if actuals_series is not None:
+            actuals = actuals_series.reindex(test_returns.index).values
+            proxy_name = actuals_series.name or "custom"
+        else:
+            actuals = test_returns.values ** 2
+            proxy_name = "squared_returns"
 
         return ForecastResult(
             name=name,
             forecasts=pd.Series(forecasts, index=test_returns.index),
             actuals=pd.Series(actuals, index=test_returns.index),
             refit_indices=refit_indices,
+            proxy=proxy_name,
         )
 
     def evaluate_many(
@@ -129,6 +140,7 @@ class RollingEvaluator:
         specs: list[tuple[Callable, str]],
         train_returns: pd.Series,
         test_returns: pd.Series,
+        actuals_series: pd.Series | None = None,
         verbose: bool = True,
     ) -> dict[str, ForecastResult]:
         """
@@ -136,13 +148,16 @@ class RollingEvaluator:
 
         Parameters
         ----------
-        specs : list of (factory_callable, name) tuples
+        specs          : list of (factory_callable, name) tuples
+        actuals_series : pre-computed variance proxy (passed through to evaluate())
         """
         results: dict[str, ForecastResult] = {}
         for factory, name in specs:
             if verbose:
                 print(f"Evaluating {name}...")
             results[name] = self.evaluate(
-                factory, name, train_returns, test_returns, verbose=verbose
+                factory, name, train_returns, test_returns,
+                actuals_series=actuals_series,
+                verbose=verbose,
             )
         return results
