@@ -12,16 +12,29 @@ class MCSResult:
     alpha: float
     loss: str
 
-    def summary(self) -> pd.DataFrame:
+    def summary(self, mark_early_stop: bool = False) -> pd.DataFrame:
         """
         DataFrame sorted by MCS p-value descending.
         Models with in_mcs=True belong to the MCS at level `alpha`.
+
+        By default (`mark_early_stop=False`) the output is the original two-column
+        frame (`mcs_pvalue`, `in_mcs`), where survivors carry the placeholder 1.0.
+
+        This procedure stops at the first non-rejection (Hansen et al. 2011), so
+        that 1.0 is *not* an actual bootstrap p-value — only a flag meaning "in
+        the set at this alpha". Set `mark_early_stop=True` to instead show those
+        placeholders as NaN in `mcs_pvalue` (so they are not misread as real
+        p-values) and add a boolean `early_stop` column. For graded p-values that
+        rank models within the set, use `arch_mcs()`.
         """
         df = (
             pd.DataFrame({"mcs_pvalue": self.pvalues})
             .sort_values("mcs_pvalue", ascending=False)
         )
         df["in_mcs"] = df["mcs_pvalue"] > self.alpha
+        if mark_early_stop:
+            df["early_stop"] = [name in self.included for name in df.index]
+            df.loc[df["early_stop"], "mcs_pvalue"] = np.nan
         return df
 
     def __repr__(self) -> str:
