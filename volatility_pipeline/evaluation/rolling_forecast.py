@@ -69,8 +69,12 @@ class RollingEvaluator:
     uses all returns from the beginning up to t (growing window).
 
     window_type="sliding": fixed-width scheme — at step t the model uses the
-    most recent `len(train_returns)` observations, so the window shifts by one
-    at each step while its length stays constant.
+    most recent `window_size` observations, so the window shifts by one at each
+    step while its length stays constant. If `window_size` is None it defaults
+    to `len(train_returns)`; set it explicitly (e.g. 500 ≈ 2y, 750 ≈ 3y) to run
+    a genuinely narrow rolling window that is sensitive to regime shifts. A wide
+    sliding window (≈ training length) overlaps almost entirely with the
+    expanding window over a short test period and cannot reveal regime effects.
 
     Parameters are re-estimated every `refit_every` steps in both modes.
     """
@@ -80,14 +84,18 @@ class RollingEvaluator:
         n_ahead: int = 1,
         refit_every: int = 10,
         window_type: Literal["expanding", "sliding"] = "expanding",
+        window_size: int | None = None,
     ) -> None:
         if n_ahead != 1:
             raise NotImplementedError("Only n_ahead=1 is currently supported.")
         if window_type not in ("expanding", "sliding"):
             raise ValueError("window_type must be 'expanding' or 'sliding'.")
+        if window_size is not None and window_size < 1:
+            raise ValueError("window_size must be a positive integer or None.")
         self.n_ahead = n_ahead
         self.refit_every = refit_every
         self.window_type = window_type
+        self.window_size = window_size
 
     def evaluate(
         self,
@@ -117,6 +125,13 @@ class RollingEvaluator:
         n_train = len(train_returns)
         n_test = len(test_returns)
 
+        # Sliding-window width: explicit window_size, else full training length.
+        width = self.window_size if self.window_size is not None else n_train
+        if self.window_type == "sliding" and width > n_train:
+            raise ValueError(
+                f"window_size ({width}) cannot exceed training length ({n_train})."
+            )
+
         forecasts = np.empty(n_test)
         refit_indices: list[int] = []
         model = None
@@ -124,7 +139,8 @@ class RollingEvaluator:
         for i in range(n_test):
             if i % self.refit_every == 0:
                 if self.window_type == "sliding":
-                    current_train = all_returns.iloc[i : n_train + i]
+                    # Window of `width` obs ending just before the forecast point.
+                    current_train = all_returns.iloc[n_train + i - width : n_train + i]
                 else:
                     current_train = all_returns.iloc[: n_train + i]
                 model = model_factory()

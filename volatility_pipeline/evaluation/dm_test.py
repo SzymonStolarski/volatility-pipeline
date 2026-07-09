@@ -147,3 +147,68 @@ def dm_matrix(
             pval_df.loc[names[i], names[j]] = pval
 
     return stat_df, pval_df
+
+
+def _family_of(name: str) -> str:
+    """Model family = name with the trailing '-DIST' suffix removed.
+
+    'GARCH-NORMAL' -> 'GARCH', 'GJR-GARCH-T' -> 'GJR-GARCH'.
+    """
+    return name.rsplit("-", 1)[0]
+
+
+def dm_family_split(
+    pval_df: pd.DataFrame,
+    alpha: float = 0.05,
+    family_of=_family_of,
+) -> dict:
+    """
+    Partition pairwise DM results into within-family and between-family blocks.
+
+    Motivation: models that share the same variance equation and differ only in
+    the error distribution (e.g. GARCH-NORMAL vs GARCH-T) are (near-)nested —
+    the Normal is the limiting case of the Student-t/GED. For nested models the
+    loss-differential variance is near-degenerate under H0, which inflates the
+    DM statistic and makes the standard test oversized (Clark-McCracken;
+    Giacomini-White 2006). Reporting within- and between-family rejection rates
+    separately avoids reading spurious within-family rejections as evidence of
+    genuine forecast superiority.
+
+    Parameters
+    ----------
+    pval_df   : upper-triangular DM p-value DataFrame from dm_matrix()
+    alpha     : significance threshold
+    family_of : callable mapping a model name to its family label
+
+    Returns
+    -------
+    dict with keys 'within' and 'between', each a dict of
+    {n_significant, n_total, rate, pairs} where pairs is a list of
+    (model_i, model_j, pvalue) sorted by p-value ascending.
+    """
+    names = list(pval_df.index)
+    n = len(names)
+    within_pairs, between_pairs = [], []
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            p = pval_df.iloc[i, j]
+            if pd.isna(p):
+                continue
+            same = family_of(names[i]) == family_of(names[j])
+            (within_pairs if same else between_pairs).append(
+                (names[i], names[j], float(p))
+            )
+
+    def _block(pairs):
+        pairs_sorted = sorted(pairs, key=lambda x: x[2])
+        n_sig = sum(1 for _, _, p in pairs_sorted if p < alpha)
+        n_tot = len(pairs_sorted)
+        return {
+            "n_significant": n_sig,
+            "n_total": n_tot,
+            "rate": (n_sig / n_tot) if n_tot else float("nan"),
+            "pairs": pairs_sorted,
+        }
+
+    return {"within": _block(within_pairs), "between": _block(between_pairs)}
