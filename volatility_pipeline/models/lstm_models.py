@@ -86,6 +86,16 @@ def _fit_network(
     device: torch.device,
 ) -> _LSTMNet:
     """Train an _LSTMNet with early stopping on a time-ordered validation tail."""
+    # Single-threaded CPU training, for two reasons:
+    # 1. Safety — sklearn and torch pip wheels each bundle their own libomp on
+    #    macOS; when both are loaded (this package imports both), torch entering
+    #    a multi-threaded CPU parallel region segfaults. One thread avoids the
+    #    OpenMP parallel region entirely, regardless of import order.
+    # 2. Speed — nets this small gain nothing from >1 threads (measured parity),
+    #    and one thread per process is required anyway when models run under
+    #    process-level parallelism (RollingEvaluator n_jobs != 1).
+    if device.type == "cpu":
+        torch.set_num_threads(1)
     torch.manual_seed(seed)
 
     n = len(X)
