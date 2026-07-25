@@ -6,5 +6,6 @@ matplotlib
 yfinance
 xgboost>=2.0
 scikit-learn>=1.0
+statsmodels>=0.14
 optuna>=3.0
 torch>=2.2
