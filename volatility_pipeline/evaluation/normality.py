@@ -70,6 +70,35 @@ def _default_hac_lags(T: int) -> int:
     return max(1, int(np.floor(4.0 * (T / 100.0) ** (2.0 / 9.0))))
 
 
+def _as_clean_series(x, min_obs: int, caller: str) -> pd.Series:
+    """
+    Coerce input to a 1-D float Series with NaNs dropped, and fail loudly if
+    there are too few observations.
+
+    Without this guard a short or empty series reaches statsmodels/numpy and
+    surfaces as an opaque error ("negative dimensions are not allowed"), which
+    is almost always an upstream data problem — e.g. a failed yfinance download
+    leaving `returns` empty, or an over-narrow date filter.
+    """
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] != 1:
+            raise ValueError(
+                f"{caller}: expected a 1-D series, got a DataFrame with "
+                f"{x.shape[1]} columns. Pass a single column (e.g. df['Close'])."
+            )
+        x = x.iloc[:, 0]
+    s = pd.Series(np.asarray(x, dtype=float).ravel()).dropna()
+    if s.size < min_obs:
+        raise ValueError(
+            f"{caller}: only {s.size} usable (non-NaN) observation(s); "
+            f"at least {min_obs} are required. This usually means the input "
+            f"series is empty or nearly empty upstream — check that the price "
+            f"download succeeded and that the date filters are not too narrow "
+            f"(e.g. print len(returns) before calling)."
+        )
+    return s
+
+
 def _stationary_block_indices(
     T: int, block_size: int, rng: np.random.Generator
 ) -> np.ndarray:
@@ -108,25 +137,36 @@ def dependence_diagnostics(
     - Engle ARCH-LM on returns      -> tests for ARCH effects
       (expected: strongly significant).
 
+    Lags larger than the sample allows are dropped/capped rather than passed
+    through to statsmodels, which would fail with an opaque array-shape error.
+
     Returns a tidy DataFrame: test | lag | statistic | p_value.
     """
     from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 
-    r = pd.Series(returns, dtype=float).dropna()
+    r = _as_clean_series(returns, min_obs=30, caller="dependence_diagnostics")
+    T = r.size
     rows: list[dict] = []
 
-    lb_r = acorr_ljungbox(r, lags=list(lb_lags), return_df=True)
+    # Ljung-Box needs lag < T; ARCH-LM regresses on `arch_lags` lags, so it needs
+    # comfortably more observations than lags.
+    lb_use = [int(l) for l in lb_lags if 0 < int(l) < T]
+    if not lb_use:
+        lb_use = [max(1, min(10, T - 1))]
+    arch_use = max(1, min(int(arch_lags), (T - 1) // 3))
+
+    lb_r = acorr_ljungbox(r, lags=lb_use, return_df=True)
     for lag, row in lb_r.iterrows():
         rows.append({"test": "Ljung-Box (returns)", "lag": int(lag),
                      "statistic": float(row["lb_stat"]), "p_value": float(row["lb_pvalue"])})
 
-    lb_r2 = acorr_ljungbox(r ** 2, lags=list(lb_lags), return_df=True)
+    lb_r2 = acorr_ljungbox(r ** 2, lags=lb_use, return_df=True)
     for lag, row in lb_r2.iterrows():
         rows.append({"test": "Ljung-Box (squared returns)", "lag": int(lag),
                      "statistic": float(row["lb_stat"]), "p_value": float(row["lb_pvalue"])})
 
-    lm_stat, lm_pval, _f_stat, _f_pval = het_arch(r, nlags=arch_lags)
-    rows.append({"test": "Engle ARCH-LM", "lag": int(arch_lags),
+    lm_stat, lm_pval, _f_stat, _f_pval = het_arch(r, nlags=arch_use)
+    rows.append({"test": "Engle ARCH-LM", "lag": int(arch_use),
                  "statistic": float(lm_stat), "p_value": float(lm_pval)})
 
     return pd.DataFrame(rows, columns=["test", "lag", "statistic", "p_value"])
@@ -155,11 +195,12 @@ def bai_ng_normality(x, hac_lags: int | None = None) -> dict:
 
     Returns a dict of statistics and p-values (robust and i.i.d.).
     """
-    x = np.asarray(x, dtype=float)
+    x = _as_clean_series(x, min_obs=20, caller="bai_ng_normality").to_numpy()
     x = x[np.isfinite(x)]
     T = x.size
     if hac_lags is None:
         hac_lags = _default_hac_lags(T)
+    hac_lags = max(1, min(int(hac_lags), T - 2))
 
     z = (x - x.mean()) / x.std(ddof=0)
     h3 = z ** 3 - 3.0 * z
@@ -228,7 +269,7 @@ def ks_block_bootstrap(
     KS p-value also ignores. For a fully specified null on the residual scale,
     prefer testing standardized GARCH residuals with a parametric bootstrap.
     """
-    x = np.asarray(x, dtype=float)
+    x = _as_clean_series(x, min_obs=20, caller="ks_block_bootstrap").to_numpy()
     x = x[np.isfinite(x)]
     T = x.size
     mu = x.mean()
