@@ -100,6 +100,19 @@ def param_table(models: dict, *, include_stars: bool = True) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 
+# Conventional equation order for parameter columns, rather than alphabetical.
+_PARAM_ORDER = ["mu", "omega", "alpha[1]", "gamma[1]", "beta[1]",
+                "phi", "d", "beta", "delta", "nu", "lambda"]
+
+
+def _order_and_reindex(wide: pd.DataFrame, models: dict) -> pd.DataFrame:
+    """Column order per `_PARAM_ORDER` (unknowns last), rows in `models` order."""
+    ordered = [c for c in _PARAM_ORDER if c in wide.columns]
+    ordered += [c for c in wide.columns if c not in ordered]
+    wide = wide[ordered]
+    return wide.reindex([n for n in models if n in wide.index])
+
+
 def param_matrix(
     models: dict,
     *,
@@ -133,17 +146,30 @@ def param_matrix(
         + " (" + long[show].map(fmt.format) + ")"
     )
     wide = long.pivot(index="model", columns="parameter", values="cell")
+    return _order_and_reindex(wide, models).fillna("")
 
-    # Order parameters in the conventional equation order rather than
-    # alphabetically, keeping any unexpected names at the end.
-    preferred = ["mu", "omega", "alpha[1]", "gamma[1]", "beta[1]",
-                 "phi", "d", "beta", "delta", "nu", "lambda"]
-    ordered = [c for c in preferred if c in wide.columns]
-    ordered += [c for c in wide.columns if c not in ordered]
-    wide = wide[ordered]
-    # Preserve the caller's model ordering.
-    wide = wide.reindex([n for n in models if n in wide.index])
-    return wide.fillna("")
+
+def pvalue_matrix(models: dict, *, decimals: int | None = 4) -> pd.DataFrame:
+    """
+    Wide table of exact p-values: one row per model, one column per parameter.
+
+    `param_matrix`'s stars bucket significance into three tiers, which hides
+    exactly the cases worth citing precisely — a borderline p=0.041 and a
+    solid p=0.0009 both show "**"/"***"; a near-miss p=0.099 and an
+    unremarkable p=0.4 both show nothing. This gives the exact number instead,
+    for citing precise values (e.g. in a referee response) or checking
+    borderline cases directly.
+
+    Empty (NaN) cells mean the parameter does not exist for that specification.
+    Pass `decimals=None` to keep full float precision instead of rounding.
+    """
+    long = param_table(models, include_stars=False)
+    if long.empty:
+        return pd.DataFrame()
+
+    wide = long.pivot(index="model", columns="parameter", values="p_value")
+    wide = _order_and_reindex(wide, models)
+    return wide.round(decimals) if decimals is not None else wide
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ from .lstm_models import LSTMVolatilityModel, LSTMHybridModel
 from .equations import (
     param_table,
     param_matrix,
+    pvalue_matrix,
     asymmetry_summary,
     persistence,
     equation_lines,
