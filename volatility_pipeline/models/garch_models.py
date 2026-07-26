@@ -120,6 +120,39 @@ class GARCHModel:
         self._require_fitted()
         return self._result.params
 
+    @property
+    def std_err(self) -> pd.Series:
+        """Standard errors of the estimated coefficients."""
+        self._require_fitted()
+        return self._result.std_err
+
+    @property
+    def tvalues(self) -> pd.Series:
+        """t-statistics of the estimated coefficients."""
+        self._require_fitted()
+        return self._result.tvalues
+
+    @property
+    def pvalues(self) -> pd.Series:
+        """p-values of the estimated coefficients."""
+        self._require_fitted()
+        return self._result.pvalues
+
+    def param_table(self) -> pd.DataFrame:
+        """
+        Coefficient, standard error, t-statistic and p-value per parameter.
+
+        Coefficients refer to returns scaled by `self.scale` (percent by
+        default) — see `volatility_pipeline.models.equations.scale_note`.
+        """
+        self._require_fitted()
+        return pd.DataFrame({
+            "coef": self._result.params,
+            "std_err": self._result.std_err,
+            "t_stat": self._result.tvalues,
+            "p_value": self._result.pvalues,
+        })
+
     def summary(self):
         self._require_fitted()
         return self._result.summary()
