@@ -5,13 +5,28 @@ from arch import arch_model
 
 
 # Maps model_type name -> (arch vol name, extra kwargs for arch_model)
+#
+# `o` is the asymmetric (leverage) order. NOTE: arch_model()'s own default is
+# o=0, so it must be passed explicitly wherever an asymmetric term is wanted —
+# omitting it silently estimates the SYMMETRIC variant.
+#   GARCH     o=0 by definition (symmetric).
+#   GJR-GARCH o=1 by definition (it *is* GARCH with a leverage indicator).
+#   EGARCH    o=1 — the asymmetric log-variance model of Nelson (1991).
+#   APARCH    o=1 — the asymmetric power ARCH of Ding et al. (1993).
+#   FIGARCH   arch's FIGARCH has no asymmetric term (no `o` argument).
 _ARCH_VOL: dict[str, tuple[str, dict]] = {
     "GARCH":     ("GARCH",   {"o": 0}),
     "GJR-GARCH": ("GARCH",   {"o": 1}),
-    "EGARCH":    ("EGARCH",  {}),
-    "APARCH":    ("APARCH",  {}),
+    "EGARCH":    ("EGARCH",  {"o": 1}),
+    "APARCH":    ("APARCH",  {"o": 1}),
     "FIGARCH":   ("FIGARCH", {}),
 }
+
+# Specifications whose asymmetric order may be overridden via `o`. GARCH and
+# GJR-GARCH are excluded because o is what distinguishes them (setting o=1 on
+# GARCH would make it a GJR, and o=0 on GJR would make it a plain GARCH), and
+# FIGARCH is excluded because it has no asymmetric term at all.
+_ASYM_CONFIGURABLE: tuple[str, ...] = ("EGARCH", "APARCH")
 
 _ARCH_DIST: dict[str, str] = {
     "normal": "normal",
@@ -36,17 +51,40 @@ class GARCHModel:
         p: int = 1,
         q: int = 1,
         scale: float = 100.0,
+        o: int | None = None,
     ) -> None:
         if model_type not in _ARCH_VOL:
             raise ValueError(f"model_type must be one of {list(_ARCH_VOL)}, got {model_type!r}")
         if dist not in _ARCH_DIST:
             raise ValueError(f"dist must be one of {list(_ARCH_DIST)}, got {dist!r}")
+        if o is not None:
+            if model_type not in _ASYM_CONFIGURABLE:
+                raise ValueError(
+                    f"o is not configurable for {model_type!r}; it is only "
+                    f"overridable for {list(_ASYM_CONFIGURABLE)}. "
+                    f"(GARCH/GJR-GARCH are defined by o=0/o=1, and FIGARCH has "
+                    f"no asymmetric term.)"
+                )
+            if o not in (0, 1):
+                raise ValueError(f"o must be 0 or 1, got {o!r}")
         self.model_type = model_type
         self.dist = dist
         self.p = p
         self.q = q
         self.scale = scale
+        self.o = o
         self._result = None
+
+    @property
+    def asym_order(self) -> int:
+        """
+        Asymmetric (leverage) order actually used: the explicit override if one
+        was given, otherwise the specification's default. 0 means the fitted
+        model is symmetric (no gamma coefficient).
+        """
+        if self.o is not None:
+            return self.o
+        return _ARCH_VOL[self.model_type][1].get("o", 0)
 
     # ------------------------------------------------------------------
     # Fitting
@@ -54,7 +92,10 @@ class GARCHModel:
 
     def fit(self, returns: pd.Series, starting_values=None) -> "GARCHModel":
         scaled = returns * self.scale
-        vol_name, extra = _ARCH_VOL[self.model_type]
+        vol_name, defaults = _ARCH_VOL[self.model_type]
+        extra = dict(defaults)
+        if self.o is not None:
+            extra["o"] = self.o
         am = arch_model(
             scaled,
             vol=vol_name,
@@ -171,5 +212,37 @@ class GARCHModel:
     def __repr__(self) -> str:
         return (
             f"GARCHModel(model_type={self.model_type!r}, dist={self.dist!r}, "
-            f"p={self.p}, q={self.q})"
+            f"p={self.p}, q={self.q}, o={self.asym_order})"
         )
+
+
+def make_garch(
+    model_type: str,
+    dist: str = "normal",
+    asym_order: int | None = None,
+    **kwargs,
+) -> GARCHModel:
+    """
+    Build a GARCHModel, applying `asym_order` only where it is meaningful.
+
+    This is the safe way to thread a single notebook-level asymmetry switch
+    through a heterogeneous list of specifications: `asym_order` is forwarded
+    only for the specifications whose leverage order is configurable
+    (EGARCH, APARCH) and silently ignored for GARCH, GJR-GARCH and FIGARCH,
+    whose asymmetric order is part of their definition. Passing `asym_order`
+    straight to GARCHModel for those would raise.
+
+    Defined at module level (not a lambda or closure) so that
+    `functools.partial(make_garch, ...)` stays picklable for
+    RollingEvaluator's process-parallel path.
+
+    Parameters
+    ----------
+    model_type : 'GARCH' | 'GJR-GARCH' | 'EGARCH' | 'APARCH' | 'FIGARCH'
+    dist       : 'normal' | 't' | 'ged'
+    asym_order : 0 or 1 to override the leverage order of EGARCH/APARCH;
+                 None uses each specification's default (asymmetric for those two).
+    """
+    if asym_order is not None and model_type in _ASYM_CONFIGURABLE:
+        kwargs["o"] = asym_order
+    return GARCHModel(model_type, dist, **kwargs)
