@@ -32,6 +32,66 @@ def _winsorize(x: np.ndarray, bounds: tuple[float, float]) -> np.ndarray:
     return np.clip(x, bounds[0], bounds[1])
 
 
+def _log_variance_target(sq: np.ndarray, limits: tuple[float, float]) -> np.ndarray:
+    """
+    log of squared returns, floored so that near-zero returns cannot dominate.
+
+    A day with r_t = 0 (a stale or unchanged close — 21 such days in the BZ=F
+    training window) gives log(0 + _EPS) = -27.6, roughly 6 standard deviations
+    below the mean log target. Those points contribute almost all of the MSE the
+    network minimises, so it fits the zeros instead of the volatility dynamics.
+
+    Only the LOWER tail is clipped, at the same quantile used to winsorize the
+    input features. The upper tail is left intact: capping it would
+    systematically cut the forecast during exactly the high-volatility episodes
+    the model exists to predict.
+    """
+    lo = float(np.quantile(sq, limits[0]))
+    if not np.isfinite(lo) or lo <= 0.0:
+        positive = sq[sq > 0]
+        lo = float(positive.min()) if positive.size else _EPS
+    return np.log(np.maximum(sq, lo))
+
+
+def _smearing_factor(log_actual: np.ndarray, log_pred: np.ndarray) -> float:
+    """
+    Duan (1983) smearing estimate, S = mean(exp(u_i)) over the fit residuals
+    u_i = log y_i - log yhat_i.
+
+    A network trained on log(r^2) under MSE estimates E[log r^2 | X], so
+    exp(.) of its output estimates the CONDITIONAL GEOMETRIC mean, not the
+    conditional variance E[r^2 | X] that every other model in the pipeline
+    forecasts and that the loss functions score. For r_t = sqrt(h_t) z_t the two
+    differ by the constant factor exp(E[log z^2]) = exp(-1.27) ~ 0.28 under
+    normality, and by considerably more under fat tails: measured on BZ=F the
+    raw exponentiated forecast was 0.18x the GARCH level, which QLIKE
+    (log h + proxy/h) punishes severely.
+
+    Multiplying by S removes that bias without assuming log-normal residuals.
+    """
+    resid = np.asarray(log_actual, dtype=float) - np.asarray(log_pred, dtype=float)
+    s = float(np.mean(np.exp(resid)))
+    # A degenerate fit (non-finite or non-positive S) must not silently scale
+    # every forecast to nonsense; fall back to the uncorrected level.
+    return s if (np.isfinite(s) and s > 0.0) else 1.0
+
+
+def _fit_smearing(
+    net: "_LSTMNet",
+    X: np.ndarray,
+    y: np.ndarray,
+    target_scaler: RobustScaler,
+    device: torch.device,
+) -> float:
+    """Smearing factor for a log-scale target, from the in-sample residuals."""
+    if len(X) == 0:
+        return 1.0
+    inv = target_scaler.inverse_transform
+    log_pred = inv(_predict_batch(net, X, device).reshape(-1, 1)).ravel()
+    log_true = inv(np.asarray(y, dtype=float).reshape(-1, 1)).ravel()
+    return _smearing_factor(log_true, log_pred)
+
+
 def _build_sequences(
     features: np.ndarray, target: np.ndarray, lookback: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -156,6 +216,19 @@ def _predict_one(net: _LSTMNet, x: np.ndarray, device: torch.device) -> float:
         return float(net(x_t).cpu().item())
 
 
+def _predict_batch(
+    net: _LSTMNet, X: np.ndarray, device: torch.device, batch_size: int = 512
+) -> np.ndarray:
+    """In-sample predictions over the training sequences (used for smearing)."""
+    net.eval()
+    out = []
+    with torch.no_grad():
+        for start in range(0, len(X), batch_size):
+            xb = torch.from_numpy(X[start: start + batch_size]).to(device)
+            out.append(net(xb).cpu().numpy().reshape(-1))
+    return np.concatenate(out) if out else np.empty(0, dtype=float)
+
+
 class LSTMVolatilityModel:
     """
     Standalone LSTM volatility forecaster. Compatible with RollingEvaluator
@@ -163,8 +236,20 @@ class LSTMVolatilityModel:
 
     Inputs at each timestep: [return, squared_return], winsorized and
     RobustScaler-scaled (fit on the training window only, refit every call).
-    Target: log(squared_return) one step ahead, RobustScaler-scaled.
-    forecast_variance() inverse-scales and exponentiates back to variance units.
+    Target: log(squared_return) one step ahead (lower tail floored),
+    RobustScaler-scaled.
+    forecast_variance() inverse-scales, exponentiates and applies the
+    retransformation correction to return a forecast of E[r^2] in variance
+    units, comparable with the GARCH and XGB forecasts.
+
+    Parameters
+    ----------
+    retransform : how to map the log-scale network output back to variance units
+        'smearing' — Duan (1983) smearing factor estimated on the fit residuals
+                     (default; required for the forecast to estimate E[r^2|X]).
+        'none'     — plain exp(), which estimates the conditional GEOMETRIC mean
+                     and is biased low by roughly 5x on daily returns. Kept only
+                     to reproduce pre-fix results.
     """
 
     def __init__(
@@ -179,9 +264,15 @@ class LSTMVolatilityModel:
         batch_size: int = 32,
         val_fraction: float = 0.15,
         winsor_limits: tuple[float, float] = (0.01, 0.01),
+        retransform: str = "smearing",
         seed: int = 42,
         device: str | None = None,
     ) -> None:
+        if retransform not in ("smearing", "none"):
+            raise ValueError(
+                f"retransform must be 'smearing' or 'none', got {retransform!r}"
+            )
+        self.retransform   = retransform
         self.lookback      = lookback
         self.hidden_size   = hidden_size
         self.num_layers    = num_layers
@@ -199,6 +290,7 @@ class LSTMVolatilityModel:
         self._feature_scaler: RobustScaler | None = None
         self._target_scaler:  RobustScaler | None = None
         self._last_window:    np.ndarray | None = None
+        self._smearing:       float = 1.0
 
     def fit(self, returns: pd.Series) -> "LSTMVolatilityModel":
         r  = np.asarray(returns, dtype=float)
@@ -211,7 +303,7 @@ class LSTMVolatilityModel:
         self._feature_scaler = RobustScaler().fit(features)
         features_scaled = self._feature_scaler.transform(features)
 
-        log_sq = np.log(sq + _EPS)
+        log_sq = _log_variance_target(sq, self.winsor_limits)
         self._target_scaler = RobustScaler().fit(log_sq.reshape(-1, 1))
         target_scaled = self._target_scaler.transform(log_sq.reshape(-1, 1)).ravel()
 
@@ -223,6 +315,10 @@ class LSTMVolatilityModel:
             patience=self.patience, batch_size=self.batch_size,
             val_fraction=self.val_fraction, seed=self.seed, device=self.device,
         )
+        self._smearing = (
+            1.0 if self.retransform == "none"
+            else _fit_smearing(self._net, X, y, self._target_scaler, self.device)
+        )
         self._last_window = features_scaled[-self.lookback:].astype(np.float32)
         return self
 
@@ -231,7 +327,7 @@ class LSTMVolatilityModel:
             raise RuntimeError("Call .fit() first.")
         pred_scaled = _predict_one(self._net, self._last_window, self.device)
         log_pred = self._target_scaler.inverse_transform([[pred_scaled]])[0, 0]
-        pred = max(float(np.exp(log_pred)), 1e-10)
+        pred = max(float(np.exp(log_pred)) * self._smearing, 1e-10)
         return np.full(horizon, pred)
 
     def feature_names(self) -> list[str]:
@@ -240,7 +336,8 @@ class LSTMVolatilityModel:
     def __repr__(self) -> str:
         return (
             f"LSTMVolatilityModel(lookback={self.lookback}, hidden_size={self.hidden_size}, "
-            f"num_layers={self.num_layers}, device={self.device.type!r})"
+            f"num_layers={self.num_layers}, retransform={self.retransform!r}, "
+            f"device={self.device.type!r})"
         )
 
 
@@ -252,13 +349,16 @@ class LSTMHybridModel:
         Inputs at each timestep are [return, squared_return] plus the GARCH
         one-step-ahead forecast h_{t+1|t} (log-scaled), broadcast across every
         timestep of the lookback window. Final forecast = LSTM output
-        (inverse-scaled, exponentiated).
+        (inverse-scaled, exponentiated, retransformation-corrected).
 
     mode='residual':
         Inputs are [return, squared_return] only (as in the standalone model).
         Target is the GARCH residual: sq[t+1] - h_{t+1|t} (RobustScaler, no log
         transform since residuals can be negative).
         Final forecast = GARCH_forecast + LSTM_residual_correction.
+
+    `retransform` applies to 'features' mode only — see LSTMVolatilityModel.
+    'residual' mode is fit on the level scale and needs no correction.
 
     The internal GARCH model is re-estimated on every .fit() call, so the
     hybrid model is self-contained and works transparently with
@@ -282,11 +382,17 @@ class LSTMHybridModel:
         batch_size: int = 32,
         val_fraction: float = 0.15,
         winsor_limits: tuple[float, float] = (0.01, 0.01),
+        retransform: str = "smearing",
         seed: int = 42,
         device: str | None = None,
     ) -> None:
         if mode not in ("features", "residual"):
             raise ValueError(f"mode must be 'features' or 'residual', got {mode!r}")
+        if retransform not in ("smearing", "none"):
+            raise ValueError(
+                f"retransform must be 'smearing' or 'none', got {retransform!r}"
+            )
+        self.retransform      = retransform
         self.garch_model_type = garch_model_type
         self.garch_dist       = garch_dist
         self.garch_p          = garch_p
@@ -311,6 +417,7 @@ class LSTMHybridModel:
         self._garch_scaler:   RobustScaler | None = None  # 'features' mode only
         self._target_scaler:  RobustScaler | None = None  # log target ('features') or residual ('residual')
         self._last_window:    np.ndarray | None = None
+        self._smearing:       float = 1.0  # 'features' mode only
 
     def fit(self, returns: pd.Series) -> "LSTMHybridModel":
         r  = np.asarray(returns, dtype=float)
@@ -335,7 +442,7 @@ class LSTMHybridModel:
             self._garch_scaler = RobustScaler().fit(log_g.reshape(-1, 1))
             g_scaled = self._garch_scaler.transform(log_g.reshape(-1, 1)).ravel()
 
-            log_sq = np.log(sq + _EPS)
+            log_sq = _log_variance_target(sq, self.winsor_limits)
             self._target_scaler = RobustScaler().fit(log_sq.reshape(-1, 1))
             target_scaled = self._target_scaler.transform(log_sq.reshape(-1, 1)).ravel()
 
@@ -361,6 +468,14 @@ class LSTMHybridModel:
             val_fraction=self.val_fraction, seed=self.seed, device=self.device,
         )
 
+        # Retransformation correction applies only to the log-scale target used
+        # by 'features' mode; 'residual' mode is fit on the level scale.
+        self._smearing = (
+            _fit_smearing(self._net, X, y, self._target_scaler, self.device)
+            if (self.mode == "features" and self.retransform != "none")
+            else 1.0
+        )
+
         if self.mode == "features":
             garch_fc_now = float(self._garch.forecast_variance(horizon=1)[0])
             log_g_now = np.log(garch_fc_now + _EPS)
@@ -380,7 +495,7 @@ class LSTMHybridModel:
 
         if self.mode == "features":
             log_pred = self._target_scaler.inverse_transform([[pred_scaled]])[0, 0]
-            result = max(float(np.exp(log_pred)), 1e-10)
+            result = max(float(np.exp(log_pred)) * self._smearing, 1e-10)
         else:
             garch_fc = float(self._garch.forecast_variance(horizon=1)[0])
             residual = self._target_scaler.inverse_transform([[pred_scaled]])[0, 0]
@@ -397,5 +512,6 @@ class LSTMHybridModel:
     def __repr__(self) -> str:
         return (
             f"LSTMHybridModel(garch={self.garch_model_type}-{self.garch_dist}, "
-            f"mode={self.mode!r}, lookback={self.lookback}, device={self.device.type!r})"
+            f"mode={self.mode!r}, lookback={self.lookback}, "
+            f"retransform={self.retransform!r}, device={self.device.type!r})"
         )
