@@ -15,7 +15,15 @@ def garman_klass(
     σ² = 0.5·(ln H/L)² − (2·ln2 − 1)·(ln C/O)²
 
     Uses the full intraday price range, which is 5-8× less noisy than squared
-    returns. Assumes no overnight gap; always non-negative.
+    returns. Assumes no overnight gap.
+
+    NOT guaranteed non-negative: the -(2·ln2-1)·(ln C/O)² term dominates
+    whenever the close-to-open move is large relative to the recorded range,
+    which happens when the OHLC record is internally inconsistent. BZ=F has 80
+    days with H == L == O == C (proxy exactly 0, alongside a nonzero
+    close-to-close return) and 7 where the close sits outside [L, H] (proxy
+    negative), all before 2020. Callers that use this as a regression target
+    must floor it; see models/targets.log_variance_target.
     """
     ln_hl = np.log(high.values / low.values)
     ln_co = np.log(close.values / open_.values)

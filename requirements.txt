@@ -9,3 +9,4 @@ scikit-learn>=1.0
 statsmodels>=0.14
 optuna>=3.0
 torch>=2.2
+pytest>=8.0

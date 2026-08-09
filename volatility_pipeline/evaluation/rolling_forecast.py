@@ -111,19 +111,36 @@ class RollingEvaluator:
 
         Parameters
         ----------
-        model_factory  : callable() -> model with .fit(returns) and .forecast_variance(horizon)
+        model_factory  : callable() -> model implementing the three-method protocol
+                         .fit(returns, target=None), .update(returns) and
+                         .forecast_variance(horizon).  `fit` re-estimates
+                         parameters; `update` advances the model's state (the
+                         GARCH variance recursion, the ML lag window) to the end
+                         of the returns it is given WITHOUT re-estimating.
         name           : display label for this model
         train_returns  : initial training window (log returns as pd.Series);
                          also sets the fixed window length when window_type="sliding"
         test_returns   : evaluation period (log returns as pd.Series)
-        actuals_series : pre-computed variance proxy aligned to test_returns.index
-                         (e.g., Garman-Klass or Parkinson series).  If None,
-                         falls back to squared log-returns.
+        actuals_series : pre-computed variance proxy (e.g. Garman-Klass or
+                         Parkinson).  Reindexed onto test_returns.index for
+                         scoring; when it also covers the training period it is
+                         passed to fit() as the ML training target so the models
+                         learn against the proxy they are scored on.  If None,
+                         both fall back to squared log-returns.
         verbose        : print a line each time the model is re-fitted
         """
         all_returns = pd.concat([train_returns, test_returns])
         n_train = len(train_returns)
         n_test = len(test_returns)
+
+        # Training target: the proxy over the whole history, when the caller
+        # supplied enough of it. A test-only proxy still scores fine, it just
+        # cannot be used for training, so we silently fall back to r^2 there.
+        train_target = None
+        if actuals_series is not None:
+            candidate = actuals_series.reindex(all_returns.index)
+            if candidate.notna().all():
+                train_target = candidate
 
         # Sliding-window width: explicit window_size, else full training length.
         width = self.window_size if self.window_size is not None else n_train
@@ -136,16 +153,27 @@ class RollingEvaluator:
         refit_indices: list[int] = []
         model = None
 
+        fit_start = 0
+
         for i in range(n_test):
             if i % self.refit_every == 0:
                 if self.window_type == "sliding":
                     # Window of `width` obs ending just before the forecast point.
-                    current_train = all_returns.iloc[n_train + i - width : n_train + i]
+                    # fit_start is held for the whole block, so within a block
+                    # the state is filtered from the same origin the parameters
+                    # were estimated on (the window grows from `width` to
+                    # `width + refit_every - 1` before sliding again).
+                    fit_start = n_train + i - width
                 else:
-                    current_train = all_returns.iloc[: n_train + i]
+                    fit_start = 0
+                current_train = all_returns.iloc[fit_start : n_train + i]
                 model = model_factory()
                 try:
-                    model.fit(current_train)
+                    model.fit(
+                        current_train,
+                        target=None if train_target is None
+                        else train_target.iloc[fit_start : n_train + i],
+                    )
                 except Exception as exc:
                     raise RuntimeError(
                         f"[{name}] Fitting failed at test step {i}: {exc}"
@@ -153,6 +181,23 @@ class RollingEvaluator:
                 refit_indices.append(i)
                 if verbose:
                     print(f"  [{name}] re-fitted at step {i}/{n_test} ({self.window_type})")
+            else:
+                # Between re-estimations the parameters are held fixed but the
+                # state must still advance, otherwise forecast_variance() would
+                # return the value computed at the last re-fit and this would
+                # not be a one-step-ahead evaluation.
+                if not hasattr(model, "update"):
+                    raise TypeError(
+                        f"[{name}] {type(model).__name__} has no update(returns) method. "
+                        f"Models must implement fit/update/forecast_variance; without "
+                        f"update the forecast would be frozen between re-fits."
+                    )
+                try:
+                    model.update(all_returns.iloc[fit_start : n_train + i])
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"[{name}] State update failed at test step {i}: {exc}"
+                    ) from exc
 
             fc = model.forecast_variance(horizon=self.n_ahead)
             forecasts[i] = float(fc[0])
