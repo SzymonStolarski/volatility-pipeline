@@ -74,6 +74,10 @@ class GARCHModel:
         self.scale = scale
         self.o = o
         self._result = None
+        # Set by update(): the same fitted parameters filtered over a longer
+        # history, so that forecast_variance() conditions on data observed
+        # since the last fit. None means "forecast from the fit sample".
+        self._filtered = None
 
     @property
     def asym_order(self) -> int:
@@ -90,13 +94,13 @@ class GARCHModel:
     # Fitting
     # ------------------------------------------------------------------
 
-    def fit(self, returns: pd.Series, starting_values=None) -> "GARCHModel":
-        scaled = returns * self.scale
+    def _build(self, scaled: pd.Series):
+        """arch model object for this specification over `scaled` returns."""
         vol_name, defaults = _ARCH_VOL[self.model_type]
         extra = dict(defaults)
         if self.o is not None:
             extra["o"] = self.o
-        am = arch_model(
+        return arch_model(
             scaled,
             vol=vol_name,
             p=self.p,
@@ -104,11 +108,36 @@ class GARCHModel:
             dist=_ARCH_DIST[self.dist],
             **extra,
         )
+
+    def fit(self, returns: pd.Series, starting_values=None, target=None) -> "GARCHModel":
+        """
+        Estimate the model by quasi-maximum likelihood on `returns`.
+
+        `target` is accepted for interface compatibility with the ML models and
+        is IGNORED: a GARCH model has no regression target — the realized
+        variance proxy enters only at evaluation time.
+        """
+        am = self._build(returns * self.scale)
         self._result = am.fit(
             disp="off",
             starting_values=starting_values,
             show_warning=False,
         )
+        self._filtered = None
+        return self
+
+    def update(self, returns: pd.Series) -> "GARCHModel":
+        """
+        Roll the conditional-variance recursion forward without re-estimating.
+
+        The parameters stay exactly as fitted; only the state (h_t and the
+        residuals feeding it) advances to the end of `returns`. This is what
+        makes the next forecast_variance() call a genuine one-step-ahead
+        forecast rather than a stale value carried over from the last fit.
+        """
+        self._require_fitted()
+        am = self._build(returns * self.scale)
+        self._filtered = am.fix(self._result.params, first_obs=None, last_obs=None)
         return self
 
     # ------------------------------------------------------------------
@@ -131,9 +160,13 @@ class GARCHModel:
 
         Returns ndarray of shape (horizon,) in original (unscaled) units.
         Index 0 is the 1-step-ahead forecast.
+
+        Forecasts from the state left by the most recent update(), falling back
+        to the fit sample when update() has not been called.
         """
         self._require_fitted()
-        fc = self._result.forecast(horizon=horizon, reindex=False)
+        source = self._filtered if self._filtered is not None else self._result
+        fc = source.forecast(horizon=horizon, reindex=False)
         # fc.variance is a DataFrame; last row = most recent forecast window
         return fc.variance.values[-1] / (self.scale ** 2)
 

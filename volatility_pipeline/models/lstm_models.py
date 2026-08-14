@@ -6,9 +6,14 @@ import torch.nn as nn
 from sklearn.preprocessing import RobustScaler
 
 from .garch_models import GARCHModel
-
-
-_EPS = 1e-12
+from .targets import (
+    _EPS,
+    log_variance_target,
+    resolve_target,
+    smearing_factor,
+    winsor_bounds,
+    winsorize,
+)
 
 
 def _select_device(device: str | None = None) -> torch.device:
@@ -20,60 +25,6 @@ def _select_device(device: str | None = None) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-def _winsor_bounds(x: np.ndarray, limits: tuple[float, float]) -> tuple[float, float]:
-    lo_q, hi_q = limits
-    lo, hi = np.quantile(x, [lo_q, 1.0 - hi_q])
-    return float(lo), float(hi)
-
-
-def _winsorize(x: np.ndarray, bounds: tuple[float, float]) -> np.ndarray:
-    return np.clip(x, bounds[0], bounds[1])
-
-
-def _log_variance_target(sq: np.ndarray, limits: tuple[float, float]) -> np.ndarray:
-    """
-    log of squared returns, floored so that near-zero returns cannot dominate.
-
-    A day with r_t = 0 (a stale or unchanged close — 21 such days in the BZ=F
-    training window) gives log(0 + _EPS) = -27.6, roughly 6 standard deviations
-    below the mean log target. Those points contribute almost all of the MSE the
-    network minimises, so it fits the zeros instead of the volatility dynamics.
-
-    Only the LOWER tail is clipped, at the same quantile used to winsorize the
-    input features. The upper tail is left intact: capping it would
-    systematically cut the forecast during exactly the high-volatility episodes
-    the model exists to predict.
-    """
-    lo = float(np.quantile(sq, limits[0]))
-    if not np.isfinite(lo) or lo <= 0.0:
-        positive = sq[sq > 0]
-        lo = float(positive.min()) if positive.size else _EPS
-    return np.log(np.maximum(sq, lo))
-
-
-def _smearing_factor(log_actual: np.ndarray, log_pred: np.ndarray) -> float:
-    """
-    Duan (1983) smearing estimate, S = mean(exp(u_i)) over the fit residuals
-    u_i = log y_i - log yhat_i.
-
-    A network trained on log(r^2) under MSE estimates E[log r^2 | X], so
-    exp(.) of its output estimates the CONDITIONAL GEOMETRIC mean, not the
-    conditional variance E[r^2 | X] that every other model in the pipeline
-    forecasts and that the loss functions score. For r_t = sqrt(h_t) z_t the two
-    differ by the constant factor exp(E[log z^2]) = exp(-1.27) ~ 0.28 under
-    normality, and by considerably more under fat tails: measured on BZ=F the
-    raw exponentiated forecast was 0.18x the GARCH level, which QLIKE
-    (log h + proxy/h) punishes severely.
-
-    Multiplying by S removes that bias without assuming log-normal residuals.
-    """
-    resid = np.asarray(log_actual, dtype=float) - np.asarray(log_pred, dtype=float)
-    s = float(np.mean(np.exp(resid)))
-    # A degenerate fit (non-finite or non-positive S) must not silently scale
-    # every forecast to nonsense; fall back to the uncorrected level.
-    return s if (np.isfinite(s) and s > 0.0) else 1.0
 
 
 def _fit_smearing(
@@ -89,7 +40,7 @@ def _fit_smearing(
     inv = target_scaler.inverse_transform
     log_pred = inv(_predict_batch(net, X, device).reshape(-1, 1)).ravel()
     log_true = inv(np.asarray(y, dtype=float).reshape(-1, 1)).ravel()
-    return _smearing_factor(log_true, log_pred)
+    return smearing_factor(log_true, log_pred)
 
 
 def _build_sequences(
@@ -291,21 +242,37 @@ class LSTMVolatilityModel:
         self._target_scaler:  RobustScaler | None = None
         self._last_window:    np.ndarray | None = None
         self._smearing:       float = 1.0
+        # Winsorisation bounds are frozen at fit time so that update() applies
+        # the same transform the network was trained under.
+        self._r_bounds:  tuple[float, float] | None = None
+        self._sq_bounds: tuple[float, float] | None = None
 
-    def fit(self, returns: pd.Series) -> "LSTMVolatilityModel":
+    def _scaled_features(self, r: np.ndarray) -> np.ndarray:
+        r_w  = winsorize(r, self._r_bounds)
+        sq_w = winsorize(r ** 2, self._sq_bounds)
+        return self._feature_scaler.transform(np.column_stack([r_w, sq_w]))
+
+    def fit(self, returns: pd.Series, target: pd.Series | None = None) -> "LSTMVolatilityModel":
+        """
+        `target` is the realized-variance proxy aligned to `returns` — the same
+        series the evaluator scores against. None falls back to squared returns.
+        """
         r  = np.asarray(returns, dtype=float)
         sq = r ** 2
+        y_raw = resolve_target(r, None if target is None else np.asarray(target, dtype=float))
 
-        r_w  = _winsorize(r, _winsor_bounds(r, self.winsor_limits))
-        sq_w = _winsorize(sq, _winsor_bounds(sq, self.winsor_limits))
+        self._r_bounds  = winsor_bounds(r, self.winsor_limits)
+        self._sq_bounds = winsor_bounds(sq, self.winsor_limits)
 
-        features = np.column_stack([r_w, sq_w])
+        features = np.column_stack([
+            winsorize(r, self._r_bounds), winsorize(sq, self._sq_bounds)
+        ])
         self._feature_scaler = RobustScaler().fit(features)
         features_scaled = self._feature_scaler.transform(features)
 
-        log_sq = _log_variance_target(sq, self.winsor_limits)
-        self._target_scaler = RobustScaler().fit(log_sq.reshape(-1, 1))
-        target_scaled = self._target_scaler.transform(log_sq.reshape(-1, 1)).ravel()
+        log_var = log_variance_target(y_raw, self.winsor_limits[0])
+        self._target_scaler = RobustScaler().fit(log_var.reshape(-1, 1))
+        target_scaled = self._target_scaler.transform(log_var.reshape(-1, 1)).ravel()
 
         X, y = _build_sequences(features_scaled, target_scaled, self.lookback)
         self._net = _fit_network(
@@ -320,6 +287,24 @@ class LSTMVolatilityModel:
             else _fit_smearing(self._net, X, y, self._target_scaler, self.device)
         )
         self._last_window = features_scaled[-self.lookback:].astype(np.float32)
+        return self
+
+    def update(self, returns: pd.Series) -> "LSTMVolatilityModel":
+        """
+        Slide the input window forward without retraining.
+
+        The winsorisation bounds and both scalers stay exactly as fitted —
+        refitting them on the growing sample would change the transform the
+        network was trained under.
+        """
+        if self._net is None:
+            raise RuntimeError("Call .fit() first.")
+        r = np.asarray(returns, dtype=float)
+        if len(r) < self.lookback:
+            raise ValueError(
+                f"update needs at least lookback={self.lookback} observations, got {len(r)}."
+            )
+        self._last_window = self._scaled_features(r)[-self.lookback:].astype(np.float32)
         return self
 
     def forecast_variance(self, horizon: int = 1) -> np.ndarray:
@@ -418,11 +403,35 @@ class LSTMHybridModel:
         self._target_scaler:  RobustScaler | None = None  # log target ('features') or residual ('residual')
         self._last_window:    np.ndarray | None = None
         self._smearing:       float = 1.0  # 'features' mode only
+        # Frozen at fit time so that update() applies the same transform the
+        # network was trained under.
+        self._r_bounds:  tuple[float, float] | None = None
+        self._sq_bounds: tuple[float, float] | None = None
 
-    def fit(self, returns: pd.Series) -> "LSTMHybridModel":
+    def _scaled_features(self, r: np.ndarray) -> np.ndarray:
+        r_w  = winsorize(r, self._r_bounds)
+        sq_w = winsorize(r ** 2, self._sq_bounds)
+        return self._feature_scaler.transform(np.column_stack([r_w, sq_w]))
+
+    def _current_window(self, base_scaled: np.ndarray) -> np.ndarray:
+        """Input window ending at the last observation, with the GARCH channel."""
+        if self.mode != "features":
+            return base_scaled[-self.lookback:].astype(np.float32)
+        garch_fc_now = float(self._garch.forecast_variance(horizon=1)[0])
+        log_g_now = np.log(garch_fc_now + _EPS)
+        g_now_scaled = self._garch_scaler.transform([[log_g_now]])[0, 0]
+        g_col = np.full((self.lookback, 1), g_now_scaled, dtype=np.float32)
+        return np.hstack([base_scaled[-self.lookback:], g_col]).astype(np.float32)
+
+    def fit(self, returns: pd.Series, target: pd.Series | None = None) -> "LSTMHybridModel":
+        """
+        `target` is the realized-variance proxy aligned to `returns` — the same
+        series the evaluator scores against. None falls back to squared returns.
+        """
         r  = np.asarray(returns, dtype=float)
         sq = r ** 2
         n  = len(r)
+        y_raw = resolve_target(r, None if target is None else np.asarray(target, dtype=float))
 
         self._garch = GARCHModel(
             self.garch_model_type, self.garch_dist, self.garch_p, self.garch_q
@@ -430,10 +439,12 @@ class LSTMHybridModel:
         self._garch.fit(returns)
         g_var = self._garch.insample_variance().values  # h_{t|t-1}
 
-        r_w  = _winsorize(r, _winsor_bounds(r, self.winsor_limits))
-        sq_w = _winsorize(sq, _winsor_bounds(sq, self.winsor_limits))
+        self._r_bounds  = winsor_bounds(r, self.winsor_limits)
+        self._sq_bounds = winsor_bounds(sq, self.winsor_limits)
 
-        base_features = np.column_stack([r_w, sq_w])
+        base_features = np.column_stack([
+            winsorize(r, self._r_bounds), winsorize(sq, self._sq_bounds)
+        ])
         self._feature_scaler = RobustScaler().fit(base_features)
         base_scaled = self._feature_scaler.transform(base_features)
 
@@ -442,9 +453,9 @@ class LSTMHybridModel:
             self._garch_scaler = RobustScaler().fit(log_g.reshape(-1, 1))
             g_scaled = self._garch_scaler.transform(log_g.reshape(-1, 1)).ravel()
 
-            log_sq = _log_variance_target(sq, self.winsor_limits)
-            self._target_scaler = RobustScaler().fit(log_sq.reshape(-1, 1))
-            target_scaled = self._target_scaler.transform(log_sq.reshape(-1, 1)).ravel()
+            log_var = log_variance_target(y_raw, self.winsor_limits[0])
+            self._target_scaler = RobustScaler().fit(log_var.reshape(-1, 1))
+            target_scaled = self._target_scaler.transform(log_var.reshape(-1, 1)).ravel()
 
             rows, targets = [], []
             for i in range(self.lookback, n - 1):
@@ -455,7 +466,7 @@ class LSTMHybridModel:
             X = np.array(rows, dtype=np.float32)
             y = np.array(targets, dtype=np.float32)
         else:  # residual
-            residual = sq - g_var
+            residual = y_raw - g_var
             self._target_scaler = RobustScaler().fit(residual.reshape(-1, 1))
             target_scaled = self._target_scaler.transform(residual.reshape(-1, 1)).ravel()
             X, y = _build_sequences(base_scaled, target_scaled, self.lookback)
@@ -476,16 +487,23 @@ class LSTMHybridModel:
             else 1.0
         )
 
-        if self.mode == "features":
-            garch_fc_now = float(self._garch.forecast_variance(horizon=1)[0])
-            log_g_now = np.log(garch_fc_now + _EPS)
-            g_now_scaled = self._garch_scaler.transform([[log_g_now]])[0, 0]
-            base_window = base_scaled[-self.lookback:]
-            g_col = np.full((self.lookback, 1), g_now_scaled, dtype=np.float32)
-            self._last_window = np.hstack([base_window, g_col]).astype(np.float32)
-        else:
-            self._last_window = base_scaled[-self.lookback:].astype(np.float32)
+        self._last_window = self._current_window(base_scaled)
+        return self
 
+    def update(self, returns: pd.Series) -> "LSTMHybridModel":
+        """
+        Slide the input window forward and roll the GARCH state, without
+        retraining either. Scalers and winsorisation bounds stay as fitted.
+        """
+        if self._net is None or self._garch is None:
+            raise RuntimeError("Call .fit() first.")
+        r = np.asarray(returns, dtype=float)
+        if len(r) < self.lookback:
+            raise ValueError(
+                f"update needs at least lookback={self.lookback} observations, got {len(r)}."
+            )
+        self._garch.update(returns)
+        self._last_window = self._current_window(self._scaled_features(r))
         return self
 
     def forecast_variance(self, horizon: int = 1) -> np.ndarray:

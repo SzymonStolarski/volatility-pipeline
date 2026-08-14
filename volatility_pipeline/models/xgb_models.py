@@ -4,6 +4,7 @@ import pandas as pd
 import xgboost as xgb
 
 from .garch_models import GARCHModel
+from .targets import log_variance_target, resolve_target, smearing_factor
 
 
 _DEFAULT_XGB_PARAMS: dict = {
@@ -80,8 +81,9 @@ class XGBVolatilityModel:
     Standalone XGBoost volatility forecaster.
 
     Features: n_lags of lagged squared returns; optionally also lagged raw returns.
-    Target:   next-step squared return (realized variance proxy).
-    Compatible with RollingEvaluator (.fit / .forecast_variance interface).
+    Target:   the next-step realized-variance proxy supplied by the caller
+              (see `fit`), falling back to squared returns.
+    Compatible with RollingEvaluator (.fit / .update / .forecast_variance).
     """
 
     def __init__(
@@ -93,22 +95,40 @@ class XGBVolatilityModel:
         optuna_n_jobs: int = 1,
         xgb_params: dict | None = None,
         seed: int = 42,
+        log_target: bool = True,
+        retransform: str = "smearing",
+        target_floor_q: float = 0.01,
     ) -> None:
-        self.n_lags        = n_lags
-        self.use_returns   = use_returns
-        self.use_optuna    = use_optuna
-        self.n_trials      = n_trials
-        self.optuna_n_jobs = optuna_n_jobs
-        self.xgb_params    = dict(xgb_params or _DEFAULT_XGB_PARAMS)
-        self.seed          = seed
+        if retransform not in ("smearing", "none"):
+            raise ValueError(
+                f"retransform must be 'smearing' or 'none', got {retransform!r}"
+            )
+        self.n_lags         = n_lags
+        self.use_returns    = use_returns
+        self.use_optuna     = use_optuna
+        self.n_trials       = n_trials
+        self.optuna_n_jobs  = optuna_n_jobs
+        self.xgb_params     = dict(xgb_params or _DEFAULT_XGB_PARAMS)
+        self.seed           = seed
+        self.log_target     = log_target
+        self.retransform    = retransform
+        self.target_floor_q = target_floor_q
         self._model: xgb.XGBRegressor | None = None
         self._last_sq: np.ndarray | None = None
         self._last_r:  np.ndarray | None = None
+        self._smearing: float = 1.0
 
-    def fit(self, returns: pd.Series) -> "XGBVolatilityModel":
+    def fit(self, returns: pd.Series, target: pd.Series | None = None) -> "XGBVolatilityModel":
+        """
+        `target` is the realized-variance proxy aligned to `returns` — the same
+        series the evaluator scores against. None falls back to squared returns.
+        """
         r  = np.asarray(returns, dtype=float)
         sq = r ** 2
-        X, y = self._build_features(sq, r)
+        y_raw = resolve_target(r, None if target is None else np.asarray(target, dtype=float))
+        X, y = self._build_features(sq, r, y_raw)
+        if self.log_target:
+            y = log_variance_target(y, self.target_floor_q)
         params = (
             _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs)
             if self.use_optuna
@@ -116,9 +136,29 @@ class XGBVolatilityModel:
         )
         self._model = xgb.XGBRegressor(**params)
         self._model.fit(X, y)
-        self._last_sq = sq[-self.n_lags:].copy()
+        self._smearing = (
+            smearing_factor(y, self._model.predict(X))
+            if (self.log_target and self.retransform == "smearing" and len(X))
+            else 1.0
+        )
+        self.update(returns)
+        return self
+
+    def update(self, returns: pd.Series) -> "XGBVolatilityModel":
+        """Refresh the lagged-feature state without refitting the booster."""
+        r  = np.asarray(returns, dtype=float)
+        if len(r) < self.n_lags:
+            raise ValueError(
+                f"update needs at least n_lags={self.n_lags} observations, got {len(r)}."
+            )
+        self._last_sq = (r ** 2)[-self.n_lags:].copy()
         self._last_r  = r[-self.n_lags:].copy()
         return self
+
+    def _retransform(self, raw: float) -> float:
+        if self.log_target:
+            return float(np.exp(raw)) * self._smearing
+        return max(float(raw), 1e-10)
 
     def forecast_variance(self, horizon: int = 1) -> np.ndarray:
         if self._model is None:
@@ -126,7 +166,7 @@ class XGBVolatilityModel:
         row = list(self._last_sq[::-1])
         if self.use_returns:
             row += list(self._last_r[::-1])
-        pred = max(float(self._model.predict(np.array([row]))[0]), 1e-10)
+        pred = self._retransform(float(self._model.predict(np.array([row]))[0]))
         return np.full(horizon, pred)
 
     def feature_names(self) -> list[str]:
@@ -136,7 +176,7 @@ class XGBVolatilityModel:
         return names
 
     def _build_features(
-        self, sq: np.ndarray, r: np.ndarray
+        self, sq: np.ndarray, r: np.ndarray, y_raw: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         n = len(sq)
         rows, targets = [], []
@@ -145,7 +185,7 @@ class XGBVolatilityModel:
             if self.use_returns:
                 row += list(r[i - self.n_lags + 1 : i + 1][::-1])
             rows.append(row)
-            targets.append(sq[i + 1])
+            targets.append(y_raw[i + 1])
         return np.array(rows, dtype=float), np.array(targets, dtype=float)
 
     def __repr__(self) -> str:
@@ -186,9 +226,16 @@ class XGBHybridModel:
         optuna_n_jobs: int = 1,
         xgb_params: dict | None = None,
         seed: int = 42,
+        log_target: bool = True,
+        retransform: str = "smearing",
+        target_floor_q: float = 0.01,
     ) -> None:
         if mode not in ("features", "residual"):
             raise ValueError(f"mode must be 'features' or 'residual', got {mode!r}")
+        if retransform not in ("smearing", "none"):
+            raise ValueError(
+                f"retransform must be 'smearing' or 'none', got {retransform!r}"
+            )
         self.garch_model_type = garch_model_type
         self.garch_dist       = garch_dist
         self.garch_p          = garch_p
@@ -201,15 +248,26 @@ class XGBHybridModel:
         self.optuna_n_jobs    = optuna_n_jobs
         self.xgb_params       = dict(xgb_params or _DEFAULT_XGB_PARAMS)
         self.seed             = seed
+        # The log target applies to 'features' mode only: 'residual' mode is fit
+        # on proxy - h, which is negative about half the time and has no log.
+        self.log_target       = bool(log_target) and mode == "features"
+        self.retransform      = retransform
+        self.target_floor_q   = target_floor_q
         self._garch: GARCHModel | None       = None
         self._xgb: xgb.XGBRegressor | None  = None
         self._last_sq: np.ndarray | None     = None
         self._last_r:  np.ndarray | None     = None
+        self._smearing: float                = 1.0
 
-    def fit(self, returns: pd.Series) -> "XGBHybridModel":
+    def fit(self, returns: pd.Series, target: pd.Series | None = None) -> "XGBHybridModel":
+        """
+        `target` is the realized-variance proxy aligned to `returns` — the same
+        series the evaluator scores against. None falls back to squared returns.
+        """
         r  = np.asarray(returns, dtype=float)
         sq = r ** 2
         n  = len(r)
+        y_raw = resolve_target(r, None if target is None else np.asarray(target, dtype=float))
 
         self._garch = GARCHModel(
             self.garch_model_type, self.garch_dist, self.garch_p, self.garch_q
@@ -220,19 +278,21 @@ class XGBHybridModel:
 
         rows, targets = [], []
         for i in range(self.n_lags, n - 1):
-            # predicting sq[i+1]; use g_var[i+1] = h_{i+1|i} as GARCH feature
+            # predicting y_raw[i+1]; use g_var[i+1] = h_{i+1|i} as GARCH feature
             row = list(sq[i - self.n_lags + 1 : i + 1][::-1])
             if self.use_returns:
                 row += list(r[i - self.n_lags + 1 : i + 1][::-1])
             row.append(g_var[i + 1])
             rows.append(row)
             targets.append(
-                sq[i + 1] if self.mode == "features"
-                else sq[i + 1] - g_var[i + 1]
+                y_raw[i + 1] if self.mode == "features"
+                else y_raw[i + 1] - g_var[i + 1]
             )
 
         X = np.array(rows, dtype=float)
         y = np.array(targets, dtype=float)
+        if self.log_target:
+            y = log_variance_target(y, self.target_floor_q)
 
         params = (
             _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs)
@@ -241,7 +301,28 @@ class XGBHybridModel:
         )
         self._xgb = xgb.XGBRegressor(**params)
         self._xgb.fit(X, y)
-        self._last_sq = sq[-self.n_lags:].copy()
+        self._smearing = (
+            smearing_factor(y, self._xgb.predict(X))
+            if (self.log_target and self.retransform == "smearing" and len(X))
+            else 1.0
+        )
+        self.update(returns)
+        return self
+
+    def update(self, returns: pd.Series) -> "XGBHybridModel":
+        """
+        Refresh the lagged features AND the GARCH state without refitting
+        either. The GARCH one-step forecast is an input feature, so leaving it
+        stale would defeat the point of updating the lags.
+        """
+        r = np.asarray(returns, dtype=float)
+        if len(r) < self.n_lags:
+            raise ValueError(
+                f"update needs at least n_lags={self.n_lags} observations, got {len(r)}."
+            )
+        if self._garch is not None:
+            self._garch.update(returns)
+        self._last_sq = (r ** 2)[-self.n_lags:].copy()
         self._last_r  = r[-self.n_lags:].copy()
         return self
 
@@ -254,11 +335,13 @@ class XGBHybridModel:
             row += list(self._last_r[::-1])
         row.append(garch_fc)
         xgb_pred = float(self._xgb.predict(np.array([row]))[0])
-        result = (
-            max(xgb_pred, 1e-10)
-            if self.mode == "features"
-            else max(garch_fc + xgb_pred, 1e-10)
-        )
+        if self.mode == "features":
+            result = (
+                float(np.exp(xgb_pred)) * self._smearing if self.log_target
+                else max(xgb_pred, 1e-10)
+            )
+        else:
+            result = max(garch_fc + xgb_pred, 1e-10)
         return np.full(horizon, result)
 
     def feature_names(self) -> list[str]:
