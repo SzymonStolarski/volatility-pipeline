@@ -2,7 +2,19 @@ from .rolling_forecast import RollingEvaluator, ForecastResult
 from .metrics import rmse, mae, mse, qlike, metrics_summary, compute_loss
 from .dm_test import diebold_mariano_hln, diebold_mariano_from_losses, dm_matrix, dm_family_split
 from .mcs import mcs, MCSResult, arch_mcs
-from .proxies import garman_klass, parkinson, squared_returns
+from .proxies import (
+    garman_klass,
+    parkinson,
+    rogers_satchell,
+    squared_returns,
+    overnight_variance,
+    garman_klass_overnight,
+    rogers_satchell_overnight,
+    yang_zhang,
+    overnight_gap_report,
+    compute_proxy,
+    PROXY_REGISTRY,
+)
 from .diagnostics import forecast_diagnostics
 from .normality import (
     dependence_diagnostics,
