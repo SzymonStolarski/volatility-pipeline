@@ -28,7 +28,17 @@ Layer 3 — `ks_block_bootstrap`: keeps the KS statistic but replaces its i.i.d.
     p-value with a dependence-robust one from a stationary (block) bootstrap
     (Politis & Romano 1994), the same resampling scheme used by the MCS module.
 
-`normality_report` runs all three and returns notebook-ready tables.
+Layer 4 — `residual_report` / `residual_diagnostics_table`: the same battery
+    applied to the STANDARDIZED RESIDUALS z_t = (r_t - mu) / sqrt(h_t) of a
+    fitted conditional-variance model, plus a probability-integral-transform
+    test of the model's own innovation distribution. Layers 1-3 characterise
+    the unconditional distribution of the returns, which is a variance mixture
+    and is fat-tailed under any GARCH model whatsoever — so it cannot support a
+    choice between Normal, t and GED innovations. Layer 4 is what does.
+
+`normality_report` runs Layers 1-3 on a return series; `residual_report` runs
+Layer 4 on one fitted model; `residual_diagnostics_table` summarises Layer 4
+across a whole set of them. All return notebook-ready tables.
 
 Dependencies: statsmodels (Ljung-Box, ARCH-LM), scipy (KS, Anderson-Darling).
 """
@@ -126,6 +136,7 @@ def dependence_diagnostics(
     returns,
     lb_lags: tuple[int, ...] = (10, 20),
     arch_lags: int = 10,
+    unit: str = "returns",
 ) -> pd.DataFrame:
     """
     Document serial dependence in returns.
@@ -139,6 +150,13 @@ def dependence_diagnostics(
 
     Lags larger than the sample allows are dropped/capped rather than passed
     through to statsmodels, which would fail with an opaque array-shape error.
+
+    `unit` only names the series in the "test" labels. Set it to
+    "std. residuals" when running this on standardized GARCH residuals, where
+    the SAME three tests carry the opposite expectation: after a well-specified
+    conditional-variance model there should be no autocorrelation left in the
+    squared series and no remaining ARCH, so a rejection there is evidence the
+    variance equation is misspecified rather than evidence for GARCH.
 
     Returns a tidy DataFrame: test | lag | statistic | p_value.
     """
@@ -157,12 +175,12 @@ def dependence_diagnostics(
 
     lb_r = acorr_ljungbox(r, lags=lb_use, return_df=True)
     for lag, row in lb_r.iterrows():
-        rows.append({"test": "Ljung-Box (returns)", "lag": int(lag),
+        rows.append({"test": f"Ljung-Box ({unit})", "lag": int(lag),
                      "statistic": float(row["lb_stat"]), "p_value": float(row["lb_pvalue"])})
 
     lb_r2 = acorr_ljungbox(r ** 2, lags=lb_use, return_df=True)
     for lag, row in lb_r2.iterrows():
-        rows.append({"test": "Ljung-Box (squared returns)", "lag": int(lag),
+        rows.append({"test": f"Ljung-Box (squared {unit})", "lag": int(lag),
                      "statistic": float(row["lb_stat"]), "p_value": float(row["lb_pvalue"])})
 
     lm_stat, lm_pval, _f_stat, _f_pval = het_arch(r, nlags=arch_use)
@@ -364,3 +382,303 @@ def normality_report(
     normality.insert(0, "series", name)
 
     return {"dependence": dep, "normality": normality}
+
+
+# ---------------------------------------------------------------------------
+# Layer 4 — the same battery on standardized GARCH residuals
+# ---------------------------------------------------------------------------
+#
+# Why this layer exists. Layers 1-3 describe the UNCONDITIONAL distribution of
+# the returns. That distribution is a variance mixture: even if every
+# innovation z_t is exactly Gaussian, r_t = sqrt(h_t) * z_t is fat-tailed
+# whenever h_t varies. Rejecting normality on raw returns is therefore expected
+# under any GARCH model and carries no information about which innovation
+# distribution to use. The quantity the `dist` choice is actually about is
+# z_t = (r_t - mu) / sqrt(h_t), and that is what this layer tests.
+#
+# Two distinct questions are asked, and they should not be conflated:
+#
+#   (a) Is the NORMAL innovation assumption adequate?  -> test z_t for
+#       normality (Bai-Ng, block-bootstrap KS, Anderson-Darling). Applied to a
+#       Normal-GARCH fit this is the direct evidence for or against needing a
+#       fat-tailed innovation.
+#
+#   (b) Is the FITTED distribution adequate, whichever it is? -> probability
+#       integral transform u_t = F(z_t; theta_hat) under the model's own
+#       conditional distribution, tested for uniformity (Diebold, Gunther & Tay
+#       1998). This is the only test that puts Normal, t and GED specifications
+#       on a common footing, since each is judged against the distribution it
+#       was estimated under.
+#
+# `residual_report` runs both, plus the Layer-1 dependence battery re-purposed
+# as a variance-equation adequacy check (after a well-specified model there
+# should be no ARCH left in z_t).
+
+# Asymptotic Anderson-Darling critical value at 5% for a FULLY SPECIFIED
+# continuous null (Marsaglia & Marsaglia 2004). Using it for the PIT, whose
+# parameters are estimated, makes the test conservative: estimation shrinks the
+# null distribution of A^2, so the true 5% cut-off is below this one.
+_AD_CRIT_5PCT_FULLY_SPECIFIED = 2.492
+
+
+def _anderson_darling_uniform(u: np.ndarray) -> float:
+    """
+    Anderson-Darling statistic for the U(0, 1) null.
+
+    A^2 = -n - (1/n) * sum_i (2i-1) * [ln u_(i) + ln(1 - u_(n+1-i))]
+
+    Values are clipped away from 0 and 1 before the logs. This is not cosmetic:
+    a Normal-innovation fit on fat-tailed data produces standardized residuals
+    far enough into the tail that the normal CDF saturates to exactly 0.0 or
+    1.0 in double precision, which would send A^2 to infinity for what is in
+    fact the most informative observation.
+    """
+    u = np.sort(np.asarray(u, dtype=float))
+    n = u.size
+    eps = 1.0 / (4.0 * n)      # tighter than the smallest resolvable order stat
+    u = np.clip(u, eps, 1.0 - eps)
+    i = np.arange(1, n + 1)
+    s = np.sum((2 * i - 1) * (np.log(u) + np.log1p(-u[::-1])))
+    return float(-n - s / n)
+
+
+def uniformity_block_bootstrap(
+    u,
+    n_boot: int = 2000,
+    block_size: int | None = None,
+    seed: int | None = 42,
+) -> dict:
+    """
+    Test probability-integral-transform values for uniformity on (0, 1), with a
+    dependence-robust p-value from a stationary (block) bootstrap.
+
+    Under correct specification of both the variance equation and the
+    innovation distribution, u_t = F(z_t; theta_hat) is i.i.d. U(0, 1). The KS
+    statistic D = sup_x |F_T(x) - x| measures the departure. Its i.i.d. p-value
+    is reported but is optimistic on two counts — any dependence left in z_t,
+    and the estimation of theta_hat — so the bootstrap p-value, obtained from
+    the same recentered stationary-bootstrap construction used by
+    `ks_block_bootstrap`, is the one to report.
+
+    Anderson-Darling is included because it weights the tails, which is
+    precisely where a Normal innovation assumption fails and where the choice
+    between Normal, t and GED is decided; KS is most sensitive near the median
+    and can miss it.
+    """
+    u = _as_clean_series(u, min_obs=20, caller="uniformity_block_bootstrap").to_numpy()
+    u = u[np.isfinite(u)]
+    T = u.size
+    if not ((u >= 0.0).all() and (u <= 1.0).all()):
+        raise ValueError(
+            "uniformity_block_bootstrap expects probability-integral-transform "
+            "values in [0, 1]; got values outside that range. Pass model.pit(), "
+            "not the standardized residuals themselves."
+        )
+
+    d_obs, p_iid = kstest(u, "uniform")
+
+    if block_size is None:
+        block_size = max(1, int(round(T ** (1.0 / 3.0))))
+
+    rng = np.random.default_rng(seed)
+    us = np.sort(u)
+    f_orig = np.arange(1, T + 1) / T
+
+    d_boot = np.empty(n_boot)
+    for b in range(n_boot):
+        idx = _stationary_block_indices(T, block_size, rng)
+        ub_sorted = np.sort(u[idx])
+        f_b = np.searchsorted(ub_sorted, us, side="right") / T
+        d_boot[b] = np.max(np.abs(f_b - f_orig))
+
+    p_block = float((np.sum(d_boot >= d_obs) + 1) / (n_boot + 1))
+    ad_stat = _anderson_darling_uniform(u)
+
+    return {
+        "n": int(T),
+        "ks_stat": float(d_obs),
+        "ks_pval_iid": float(p_iid),
+        "ks_pval_block_boot": p_block,
+        "block_size": int(block_size),
+        "n_boot": int(n_boot),
+        "ad_stat": ad_stat,
+        "ad_crit_5pct": float(_AD_CRIT_5PCT_FULLY_SPECIFIED),
+        "ad_reject_5pct": bool(ad_stat > _AD_CRIT_5PCT_FULLY_SPECIFIED),
+    }
+
+
+def residual_report(
+    std_resid,
+    *,
+    name: str = "model",
+    pit=None,
+    dist_label: str | None = None,
+    lb_lags: tuple[int, ...] = (10, 20),
+    arch_lags: int = 10,
+    hac_lags: int | None = None,
+    n_boot: int = 2000,
+    block_size: int | None = None,
+    seed: int | None = 42,
+) -> dict[str, pd.DataFrame]:
+    """
+    Run the diagnostic battery on one model's standardized residuals.
+
+    Parameters
+    ----------
+    std_resid  : z_t from a fitted conditional-variance model (GARCHModel.std_resid).
+    name       : model label, copied into every returned table.
+    pit        : optional u_t = F(z_t; theta_hat) (GARCHModel.pit()). When given,
+                 a third table tests the FITTED distribution; when omitted only
+                 the Normal null is examined.
+    dist_label : name of the fitted innovation distribution, for the PIT table's
+                 H0 column (e.g. "t", "ged").
+
+    Returns
+    -------
+    dict with:
+      "adequacy"  — Ljung-Box on z and z^2 plus ARCH-LM. Here a NON-rejection is
+                    the good outcome: it means the variance equation has removed
+                    the clustering. Rejection indicates a misspecified h_t, and
+                    any distributional conclusion drawn below it is unsafe.
+      "normality" — is the NORMAL innovation assumption adequate for z_t?
+      "pit"       — is the model's OWN innovation distribution adequate?
+                    Absent from the dict when `pit` is not supplied.
+    """
+    z = _as_clean_series(std_resid, min_obs=30, caller="residual_report")
+
+    adequacy = dependence_diagnostics(
+        z, lb_lags=lb_lags, arch_lags=arch_lags, unit="std. residuals"
+    )
+    adequacy.insert(0, "model", name)
+
+    bn = bai_ng_normality(z, hac_lags=hac_lags)
+    ks = ks_block_bootstrap(z, n_boot=n_boot, block_size=block_size, seed=seed)
+    normality = pd.DataFrame(
+        [
+            {"test": "Jarque-Bera", "assumption": "i.i.d.",
+             "statistic": bn["jarque_bera_stat"], "p_value": bn["jarque_bera_pval"]},
+            {"test": "Bai-Ng joint (HAC)", "assumption": "dependence-robust",
+             "statistic": bn["bai_ng_joint_stat"], "p_value": bn["bai_ng_joint_pval"]},
+            {"test": "Bai-Ng skewness (HAC)", "assumption": "dependence-robust",
+             "statistic": bn["bai_ng_skew_stat"], "p_value": bn["bai_ng_skew_pval"]},
+            {"test": "Bai-Ng kurtosis (HAC)", "assumption": "dependence-robust",
+             "statistic": bn["bai_ng_kurt_stat"], "p_value": bn["bai_ng_kurt_pval"]},
+            {"test": "KS vs Normal", "assumption": "i.i.d.",
+             "statistic": ks["ks_stat"], "p_value": ks["ks_pval_iid"]},
+            {"test": "KS vs Normal (block-bootstrap)", "assumption": "dependence-robust",
+             "statistic": ks["ks_stat"], "p_value": ks["ks_pval_block_boot"]},
+            {"test": "Anderson-Darling vs Normal",
+             "assumption": f"i.i.d.; crit@5%={ks['ad_crit_5pct']:.3f}",
+             "statistic": ks["ad_stat"], "p_value": np.nan},
+        ],
+        columns=["test", "assumption", "statistic", "p_value"],
+    )
+    normality.insert(0, "model", name)
+
+    out = {"adequacy": adequacy, "normality": normality}
+
+    if pit is not None:
+        uni = uniformity_block_bootstrap(
+            pit, n_boot=n_boot, block_size=block_size, seed=seed
+        )
+        h0 = f"fitted {dist_label}" if dist_label else "fitted distribution"
+        pit_tbl = pd.DataFrame(
+            [
+                {"test": "KS vs Uniform(0,1)", "assumption": "i.i.d.",
+                 "statistic": uni["ks_stat"], "p_value": uni["ks_pval_iid"]},
+                {"test": "KS vs Uniform(0,1) (block-bootstrap)",
+                 "assumption": "dependence-robust",
+                 "statistic": uni["ks_stat"], "p_value": uni["ks_pval_block_boot"]},
+                {"test": "Anderson-Darling vs Uniform(0,1)",
+                 "assumption": f"conservative; crit@5%={uni['ad_crit_5pct']:.3f}",
+                 "statistic": uni["ad_stat"], "p_value": np.nan},
+            ],
+            columns=["test", "assumption", "statistic", "p_value"],
+        )
+        pit_tbl.insert(0, "H0", h0)
+        pit_tbl.insert(0, "model", name)
+        out["pit"] = pit_tbl
+
+    return out
+
+
+def residual_diagnostics_table(
+    models: dict,
+    *,
+    lb_lag: int = 20,
+    arch_lags: int = 10,
+    hac_lags: int | None = None,
+    n_boot: int = 1000,
+    block_size: int | None = None,
+    seed: int | None = 42,
+) -> pd.DataFrame:
+    """
+    One-row-per-model summary across a set of fitted conditional-variance models
+    — the publication-facing version of `residual_report`.
+
+    `models` maps a display name to any object exposing `.std_resid` and,
+    optionally, `.pit()`, `.dist` and `.dist_params` (GARCHModel does). Nothing
+    is imported from the models package: the contract is duck-typed, exactly as
+    RollingEvaluator's is, so this module stays free of model dependencies.
+
+    Columns
+    -------
+    dist, nu                  the fitted innovation distribution and its shape
+                              parameter (blank for Normal).
+    LB2(lag) p, ARCH-LM p     variance-equation adequacy. LARGE p is the good
+                              outcome: no clustering left in z_t.
+    skew, ex.kurt             shape of the standardized residuals.
+    BaiNg p, KS-N p           is the NORMAL innovation assumption adequate?
+                              SMALL p rejects it.
+    AD-N                      Anderson-Darling against Normal (statistic).
+    PIT KS p, PIT AD          is the model's OWN distribution adequate?
+                              LARGE PIT p is the good outcome. NaN when the
+                              model does not expose .pit().
+
+    `n_boot` defaults lower than elsewhere in this module because two block
+    bootstraps run per model; raise it for final numbers.
+    """
+    rows: list[dict] = []
+    for name, m in models.items():
+        z = _as_clean_series(m.std_resid, min_obs=30, caller="residual_diagnostics_table")
+        T = z.size
+        lag = max(1, min(int(lb_lag), T - 1))
+
+        dep = dependence_diagnostics(
+            z, lb_lags=(lag,), arch_lags=arch_lags, unit="std. residuals"
+        )
+        lb2_p = float(dep.loc[dep["test"].str.startswith("Ljung-Box (squared"), "p_value"].iloc[0])
+        arch_p = float(dep.loc[dep["test"] == "Engle ARCH-LM", "p_value"].iloc[0])
+
+        bn = bai_ng_normality(z, hac_lags=hac_lags)
+        ks = ks_block_bootstrap(z, n_boot=n_boot, block_size=block_size, seed=seed)
+
+        shape = getattr(m, "dist_params", {}) or {}
+        row = {
+            "model": name,
+            "dist": str(getattr(m, "dist", "")),
+            "nu": float(next(iter(shape.values()))) if shape else np.nan,
+            "n": T,
+            f"LB2({lag}) p": lb2_p,
+            "ARCH-LM p": arch_p,
+            "skew": bn["skewness"],
+            "ex.kurt": bn["excess_kurtosis"],
+            "BaiNg p": bn["bai_ng_joint_pval"],
+            "KS-N p": ks["ks_pval_block_boot"],
+            "AD-N": ks["ad_stat"],
+        }
+
+        pit_fn = getattr(m, "pit", None)
+        if callable(pit_fn):
+            uni = uniformity_block_bootstrap(
+                pit_fn(), n_boot=n_boot, block_size=block_size, seed=seed
+            )
+            row["PIT KS p"] = uni["ks_pval_block_boot"]
+            row["PIT AD"] = uni["ad_stat"]
+        else:
+            row["PIT KS p"] = np.nan
+            row["PIT AD"] = np.nan
+
+        rows.append(row)
+
+    return pd.DataFrame(rows).set_index("model")
