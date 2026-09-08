@@ -9,4 +9,7 @@ from .normality import (
     bai_ng_normality,
     ks_block_bootstrap,
     normality_report,
+    uniformity_block_bootstrap,
+    residual_report,
+    residual_diagnostics_table,
 )

@@ -150,6 +150,68 @@ class GARCHModel:
         cv = self._result.conditional_volatility  # volatility (std dev), scaled
         return (cv / self.scale) ** 2
 
+    @property
+    def std_resid(self) -> pd.Series:
+        """
+        Standardized residuals z_t = (r_t - mu_hat) / sigma_hat_t.
+
+        This is the series the `dist` assumption is actually about, and the one
+        a distributional test belongs on. A normality test on the raw returns
+        describes the UNCONDITIONAL distribution, which is a variance mixture
+        and is fat-tailed even when every z_t is exactly Gaussian — so
+        rejecting normality there says nothing about which innovation
+        distribution to choose. Only the standardized residuals speak to the
+        conditional distribution the model was estimated under.
+
+        Scale-free: arch estimates on `returns * self.scale`, and the factor
+        appears in both the residual and the conditional volatility, so it
+        cancels. Values are therefore comparable across models fitted with
+        different `scale`.
+        """
+        self._require_fitted()
+        z = self._result.std_resid
+        return pd.Series(np.asarray(z, dtype=float), index=z.index, name="std_resid")
+
+    @property
+    def dist_params(self) -> dict[str, float]:
+        """
+        Estimated shape parameters of the conditional distribution.
+
+        Empty for Normal; {'nu': ...} for Student-t (degrees of freedom) and for
+        GED (the shape/power parameter, which arch also names nu). arch places
+        the distribution parameters last in the parameter vector, which is what
+        this relies on.
+        """
+        self._require_fitted()
+        k = int(self._result.model.distribution.num_params)
+        if k == 0:
+            return {}
+        return {str(name): float(v) for name, v in self._result.params.iloc[-k:].items()}
+
+    def pit(self) -> pd.Series:
+        """
+        Probability integral transform of the standardized residuals under the
+        FITTED conditional distribution: u_t = F(z_t; theta_hat).
+
+        Under correct specification of both the variance recursion and the
+        innovation distribution, u_t ~ i.i.d. U(0, 1) (Diebold, Gunther & Tay
+        1998). Testing uniformity therefore evaluates the distribution each
+        model was actually estimated under — Normal, t or GED — instead of
+        testing all of them against a Normal null, and is what turns "the
+        residuals are non-normal" into "this specification's error
+        distribution is/is not adequate".
+
+        arch's distribution CDFs are defined on the unit-variance scale, which
+        is exactly the scale of `std_resid`, so no rescaling is applied.
+        """
+        self._require_fitted()
+        z = self.std_resid
+        dist = self._result.model.distribution
+        k = int(dist.num_params)
+        params = None if k == 0 else np.asarray(self._result.params.iloc[-k:], dtype=float)
+        u = dist.cdf(np.asarray(z, dtype=float), params)
+        return pd.Series(np.asarray(u, dtype=float), index=z.index, name="pit")
+
     # ------------------------------------------------------------------
     # Forecasting
     # ------------------------------------------------------------------
