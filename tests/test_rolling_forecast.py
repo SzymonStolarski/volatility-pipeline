@@ -7,6 +7,8 @@ every `refit_every` steps but never advanced the model's state in between, so
 refit_every=10 that made 90% of a supposedly one-step-ahead evaluation stale,
 and produced exactly n_test/refit_every distinct forecasts.
 """
+from functools import partial
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -201,3 +203,103 @@ def test_garman_klass_can_be_non_positive():
                         pd.Series([50.0, 50.1], index=idx), pd.Series([50.0, 49.0], index=idx))
     assert flat.iloc[0] == 0.0
     assert flat.iloc[1] < 0.0
+
+
+# --------------------------------------------------------------------------
+# Feature — the ML training target can be decoupled from the scoring proxy
+# --------------------------------------------------------------------------
+#
+# Why this exists: an ML model trained on Garman-Klass sees the daily RANGE,
+# while a GARCH model sees only close-to-close returns. Part of any ML
+# advantage is therefore the richer information set, not the model class, and
+# with the two tied together there is no way to say how much is which. Training
+# the ML models on r^2 while scoring every model on the same proxy as before
+# separates them.
+#
+# The invariant that makes the comparison meaningful is
+# `test_garch_is_untouched_by_the_training_target`: GARCH has no regression
+# target, so its forecasts must be bit-identical across the two runs. If they
+# ever move, the comparison is measuring something else as well.
+
+_XGB = partial(XGBVolatilityModel, n_lags=5, use_optuna=False, seed=1)
+_GARCH = partial(make_garch, "GARCH", "normal")
+
+
+def test_train_target_defaults_to_the_scoring_proxy(data):
+    train, test, proxy = data
+    res = RollingEvaluator(refit_every=REFIT).evaluate(
+        _XGB, "xgb", train, test, actuals_series=proxy
+    )
+    assert res.proxy == res.train_target == proxy.name
+
+
+def test_garch_is_untouched_by_the_training_target(data):
+    """GARCH is estimated by QMLE on returns and has no regression target, so
+    changing what the ML models learn from must not move it by a single bit."""
+    train, test, proxy = data
+    ev = RollingEvaluator(refit_every=REFIT)
+    a = ev.evaluate(_GARCH, "g", train, test, actuals_series=proxy)
+    b = ev.evaluate(_GARCH, "g", train, test, actuals_series=proxy,
+                    train_target_series=(pd.concat([train, test]) ** 2).rename("squared"))
+    pd.testing.assert_series_equal(a.forecasts, b.forecasts)
+
+
+def test_ml_forecasts_move_with_the_training_target(data):
+    train, test, proxy = data
+    ev = RollingEvaluator(refit_every=REFIT)
+    a = ev.evaluate(_XGB, "xgb", train, test, actuals_series=proxy)
+    b = ev.evaluate(_XGB, "xgb", train, test, actuals_series=proxy,
+                    train_target_series=(pd.concat([train, test]) ** 2).rename("squared"))
+    assert not np.allclose(a.forecasts.values, b.forecasts.values)
+    assert b.train_target == "squared"
+    assert b.proxy == proxy.name, "scoring proxy must be unaffected"
+    pd.testing.assert_series_equal(a.actuals, b.actuals)
+
+
+def test_explicit_incomplete_train_target_raises(data):
+    """
+    An explicit request that cannot be honoured must fail loudly. Silently
+    downgrading to r^2 would produce models trained on something other than what
+    was asked for, with nothing downstream showing the difference.
+    """
+    train, test, proxy = data
+    with pytest.raises(ValueError, match="covers the training window"):
+        RollingEvaluator(refit_every=REFIT).evaluate(
+            _XGB, "xgb", train, test, actuals_series=proxy,
+            train_target_series=proxy.reindex(test.index),
+        )
+
+
+def test_test_only_scoring_proxy_records_its_fallback(data):
+    """
+    A test-only SCORING proxy is legitimate and still falls back to r^2 for
+    training — but the result must say so, rather than leaving it invisible.
+    """
+    train, test, proxy = data
+    res = RollingEvaluator(refit_every=REFIT).evaluate(
+        _XGB, "xgb", train, test, actuals_series=proxy.reindex(test.index)
+    )
+    assert res.proxy == proxy.name
+    assert res.train_target == "squared_returns"
+
+
+def test_repr_shows_the_train_target_only_when_it_differs(data):
+    train, test, proxy = data
+    ev = RollingEvaluator(refit_every=REFIT)
+    same = ev.evaluate(_XGB, "xgb", train, test, actuals_series=proxy)
+    diff = ev.evaluate(_XGB, "xgb", train, test, actuals_series=proxy,
+                       train_target_series=(pd.concat([train, test]) ** 2).rename("squared"))
+    assert "train_target" not in repr(same)
+    assert "train_target='squared'" in repr(diff)
+
+
+def test_train_target_survives_the_parallel_path(data):
+    train, test, proxy = data
+    ev = RollingEvaluator(refit_every=REFIT)
+    target = (pd.concat([train, test]) ** 2).rename("squared")
+    seq = ev.evaluate(_XGB, "xgb", train, test,
+                      actuals_series=proxy, train_target_series=target)
+    par = ev.evaluate_many([(_XGB, "xgb")], train, test, actuals_series=proxy,
+                           train_target_series=target, verbose=False, n_jobs=2)["xgb"]
+    assert par.train_target == "squared"
+    pd.testing.assert_series_equal(seq.forecasts, par.forecasts)

@@ -19,11 +19,14 @@ def _evaluate_spec(
     train_returns: pd.Series,
     test_returns: pd.Series,
     actuals_series: pd.Series | None = None,
+    train_target_series: pd.Series | None = None,
 ) -> tuple[str, "ForecastResult"]:
     """Worker function for parallel evaluation of a single model spec."""
     return name, evaluator.evaluate(
         factory, name, train_returns, test_returns,
-        actuals_series=actuals_series, verbose=False,
+        actuals_series=actuals_series,
+        train_target_series=train_target_series,
+        verbose=False,
     )
 
 
@@ -34,7 +37,15 @@ class ForecastResult:
     forecasts: pd.Series          # one-step-ahead conditional variance forecasts
     actuals: pd.Series            # realized variance proxy
     refit_indices: list[int] = field(default_factory=list)
-    proxy: str = "squared_returns"  # name of the variance proxy used
+    proxy: str = "squared_returns"       # variance proxy the forecasts are SCORED against
+    train_target: str = "squared_returns"  # proxy the ML models were TRAINED on
+    # These two are usually the same and separating them is the point of the
+    # `train_target_series` argument: it isolates how much of an ML model's
+    # performance comes from the information in a proxy rather than from the
+    # model class. It is recorded here rather than left implicit because a
+    # results table that mixes the two is unreadable after the fact, and
+    # because the GARCH family ignores it entirely (no regression target),
+    # so only some rows of a joint table are affected by it at all.
 
     @property
     def errors(self) -> pd.Series:
@@ -55,9 +66,13 @@ class ForecastResult:
 
     def __repr__(self) -> str:
         m = self.metrics()
+        target_note = (
+            "" if self.train_target == self.proxy
+            else f", train_target={self.train_target!r}"
+        )
         return (
             f"ForecastResult(name={self.name!r}, n={len(self.forecasts)}, "
-            f"proxy={self.proxy!r}, RMSE={m['RMSE']:.6e})"
+            f"proxy={self.proxy!r}{target_note}, RMSE={m['RMSE']:.6e})"
         )
 
 
@@ -104,6 +119,7 @@ class RollingEvaluator:
         train_returns: pd.Series,
         test_returns: pd.Series,
         actuals_series: pd.Series | None = None,
+        train_target_series: pd.Series | None = None,
         verbose: bool = False,
     ) -> ForecastResult:
         """
@@ -122,25 +138,65 @@ class RollingEvaluator:
                          also sets the fixed window length when window_type="sliding"
         test_returns   : evaluation period (log returns as pd.Series)
         actuals_series : pre-computed variance proxy (e.g. Garman-Klass or
-                         Parkinson).  Reindexed onto test_returns.index for
-                         scoring; when it also covers the training period it is
-                         passed to fit() as the ML training target so the models
-                         learn against the proxy they are scored on.  If None,
-                         both fall back to squared log-returns.
+                         Parkinson).  Reindexed onto test_returns.index and used
+                         to SCORE the forecasts.  If None, squared log-returns.
+        train_target_series
+                       : proxy the ML models are TRAINED against, when it should
+                         differ from the one they are scored against.  None (the
+                         default) means "train on the scoring proxy", which is
+                         the sensible default and the previous behaviour.
+
+                         Passing a different series decouples the two, which is
+                         what separates a model-class effect from an
+                         information-set effect: an ML model trained on
+                         Garman-Klass sees the daily RANGE, while a GARCH model
+                         sees only close-to-close returns, so part of any ML
+                         advantage is the extra information rather than the
+                         model. Training the same ML models on r^2 and scoring
+                         them on the same proxy as before splits the two apart.
+
+                         The GARCH family ignores this entirely — it is
+                         estimated by QMLE on returns and has no regression
+                         target — so it only moves the ML and hybrid rows.
+
+                         Must cover the training window; a series that does not
+                         raises, rather than quietly training on something else.
         verbose        : print a line each time the model is re-fitted
         """
         all_returns = pd.concat([train_returns, test_returns])
         n_train = len(train_returns)
         n_test = len(test_returns)
 
-        # Training target: the proxy over the whole history, when the caller
-        # supplied enough of it. A test-only proxy still scores fine, it just
-        # cannot be used for training, so we silently fall back to r^2 there.
+        # What the ML models learn against. Defaults to the scoring proxy, so
+        # that by default a model is trained on the quantity it is judged by.
+        target_source = (
+            train_target_series if train_target_series is not None else actuals_series
+        )
+        explicit = train_target_series is not None
+
         train_target = None
-        if actuals_series is not None:
-            candidate = actuals_series.reindex(all_returns.index)
+        train_target_name = "squared_returns"
+        if target_source is not None:
+            candidate = target_source.reindex(all_returns.index)
             if candidate.notna().all():
                 train_target = candidate
+                train_target_name = target_source.name or "custom"
+            elif explicit:
+                # An explicit request that cannot be honoured must not be
+                # downgraded in silence: the caller would get models trained on
+                # r^2 while believing they were trained on the series they
+                # passed, and nothing downstream would show the difference.
+                n_missing = int(candidate.isna().sum())
+                raise ValueError(
+                    f"[{name}] train_target_series covers the training window "
+                    f"incompletely ({n_missing} of {len(candidate)} values are "
+                    f"NaN after reindexing onto train+test). The ML models "
+                    f"cannot be trained on it. Pass a proxy computed over the "
+                    f"full history, or None to train on the scoring proxy."
+                )
+            # Not explicit and incomplete: the caller supplied a test-only
+            # scoring proxy, which is legitimate. Fall back to r^2 for
+            # training, but record that on the result rather than hiding it.
 
         # Sliding-window width: explicit window_size, else full training length.
         width = self.window_size if self.window_size is not None else n_train
@@ -215,6 +271,7 @@ class RollingEvaluator:
             actuals=pd.Series(actuals, index=test_returns.index),
             refit_indices=refit_indices,
             proxy=proxy_name,
+            train_target=train_target_name,
         )
 
     def evaluate_many(
@@ -223,6 +280,7 @@ class RollingEvaluator:
         train_returns: pd.Series,
         test_returns: pd.Series,
         actuals_series: pd.Series | None = None,
+        train_target_series: pd.Series | None = None,
         verbose: bool = True,
         n_jobs: int = 1,
     ) -> dict[str, ForecastResult]:
@@ -235,7 +293,13 @@ class RollingEvaluator:
                          For parallel execution (n_jobs != 1) factory callables
                          MUST be picklable — use ``functools.partial`` instead
                          of ``lambda``.
-        actuals_series : pre-computed variance proxy (passed through to evaluate())
+        actuals_series : variance proxy the forecasts are SCORED against
+                         (passed through to evaluate())
+        train_target_series
+                       : variance proxy the ML models are TRAINED on, when it
+                         should differ from the scoring one. None trains on the
+                         scoring proxy. See evaluate() for why decoupling them
+                         separates a model effect from an information effect.
         n_jobs         : number of parallel worker processes.
                          1  → sequential (default, safe with any factory).
                          -1 → use all available CPU cores.
@@ -256,7 +320,9 @@ class RollingEvaluator:
                     print(f"Evaluating {name}...")
                 results[name] = self.evaluate(
                     factory, name, train_returns, test_returns,
-                    actuals_series=actuals_series, verbose=verbose,
+                    actuals_series=actuals_series,
+                    train_target_series=train_target_series,
+                    verbose=verbose,
                 )
             return results
 
@@ -278,6 +344,7 @@ class RollingEvaluator:
                 executor.submit(
                     _evaluate_spec, self, factory, name,
                     train_returns, test_returns, actuals_series,
+                    train_target_series,
                 ): name
                 for factory, name in specs
             }
