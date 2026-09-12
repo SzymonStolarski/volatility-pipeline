@@ -63,8 +63,8 @@ def test_xgb_and_hybrid_forecasts_are_not_frozen(data):
     train, test, _ = data
     ev = RollingEvaluator(n_ahead=1, refit_every=REFIT)
     for factory, label in [
-        (lambda: XGBVolatilityModel(n_lags=5, use_optuna=False, seed=1), "xgb"),
-        (lambda: XGBHybridModel(n_lags=5, use_optuna=False, seed=1), "hybrid"),
+        (lambda: XGBVolatilityModel(n_lags=5, tune="never", seed=1), "xgb"),
+        (lambda: XGBHybridModel(n_lags=5, tune="never", seed=1), "hybrid"),
     ]:
         f = ev.evaluate(factory, label, train, test).forecasts.values
         assert len(np.unique(f)) == len(f), f"{label}: frozen between re-fits"
@@ -126,15 +126,15 @@ def test_missing_update_method_fails_loudly(data):
 
 def test_ml_target_defaults_to_squared_returns(data):
     train, _, _ = data
-    a = XGBVolatilityModel(n_lags=5, use_optuna=False, seed=1).fit(train)
-    b = XGBVolatilityModel(n_lags=5, use_optuna=False, seed=1).fit(train, target=train ** 2)
+    a = XGBVolatilityModel(n_lags=5, tune="never", seed=1).fit(train)
+    b = XGBVolatilityModel(n_lags=5, tune="never", seed=1).fit(train, target=train ** 2)
     assert float(a.forecast_variance(1)[0]) == pytest.approx(float(b.forecast_variance(1)[0]))
 
 
 def test_ml_target_changes_the_fit(data):
     train, _, proxy = data
-    a = XGBVolatilityModel(n_lags=5, use_optuna=False, seed=1).fit(train)
-    b = XGBVolatilityModel(n_lags=5, use_optuna=False, seed=1).fit(
+    a = XGBVolatilityModel(n_lags=5, tune="never", seed=1).fit(train)
+    b = XGBVolatilityModel(n_lags=5, tune="never", seed=1).fit(
         train, target=proxy.reindex(train.index)
     )
     assert float(a.forecast_variance(1)[0]) != pytest.approx(float(b.forecast_variance(1)[0]))
@@ -151,12 +151,12 @@ def test_evaluator_passes_the_proxy_through_to_training(data):
             seen.append(None if target is None else len(target))
             return super().fit(returns, target)
 
-    ev.evaluate(lambda: Spy(n_lags=5, use_optuna=False, seed=1), "full",
+    ev.evaluate(lambda: Spy(n_lags=5, tune="never", seed=1), "full",
                 train, test, actuals_series=proxy)
     assert all(n is not None for n in seen)
 
     seen.clear()
-    ev.evaluate(lambda: Spy(n_lags=5, use_optuna=False, seed=1), "test-only",
+    ev.evaluate(lambda: Spy(n_lags=5, tune="never", seed=1), "test-only",
                 train, test, actuals_series=proxy.reindex(test.index))
     assert all(n is None for n in seen), "a test-only proxy must not be used as a target"
 
@@ -168,7 +168,7 @@ def test_log_target_forecasts_are_strictly_positive(data):
     """
     train, test, proxy = data
     ev = RollingEvaluator(n_ahead=1, refit_every=REFIT)
-    res = ev.evaluate(lambda: XGBVolatilityModel(n_lags=5, use_optuna=False, seed=1),
+    res = ev.evaluate(lambda: XGBVolatilityModel(n_lags=5, tune="never", seed=1),
                       "xgb", train, test, actuals_series=proxy)
     f = res.forecasts.values
     assert (f > 0).all()
@@ -221,7 +221,7 @@ def test_garman_klass_can_be_non_positive():
 # target, so its forecasts must be bit-identical across the two runs. If they
 # ever move, the comparison is measuring something else as well.
 
-_XGB = partial(XGBVolatilityModel, n_lags=5, use_optuna=False, seed=1)
+_XGB = partial(XGBVolatilityModel, n_lags=5, tune="never", seed=1)
 _GARCH = partial(make_garch, "GARCH", "normal")
 
 
