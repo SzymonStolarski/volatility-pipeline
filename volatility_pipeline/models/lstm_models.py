@@ -1,4 +1,5 @@
 from __future__ import annotations
+import warnings
 import numpy as np
 import pandas as pd
 import torch
@@ -6,6 +7,7 @@ import torch.nn as nn
 from sklearn.preprocessing import RobustScaler
 
 from .garch_models import GARCHModel
+from .tuning import TuningCache, resolve_hyperparameters, validate_tune
 from .targets import (
     _EPS,
     log_variance_target,
@@ -180,7 +182,165 @@ def _predict_batch(
     return np.concatenate(out) if out else np.empty(0, dtype=float)
 
 
-class LSTMVolatilityModel:
+# ---------------------------------------------------------------------------
+# Hyperparameter search
+# ---------------------------------------------------------------------------
+
+#: Search space for the LSTM. Deliberately small: every trial trains a full
+#: network, so this is 30-60x more expensive per trial than the XGBoost search,
+#: and a wide space would buy noise rather than fit.
+#:
+#: lookback    how many days feed each prediction. Volatility is persistent, so
+#:             this trades signal against sample size — a longer window means
+#:             fewer training sequences from the same history. Together with
+#:             hidden_size it is the choice most likely to actually change the
+#:             forecasts.
+#: hidden_size capacity. With ~3,000 daily observations anything past 64 has far
+#:             more parameters than the data can identify.
+#: num_layers  depth. Note that dropout between layers only exists when this is
+#:             greater than 1, so the two interact.
+#: dropout     regularisation.
+#: lr          matters mostly through whether the net converges inside
+#:             max_epochs at all, rather than through the optimum it reaches.
+#: batch_size  gradient noise and wall-clock, jointly.
+#:
+#: max_epochs, patience and val_fraction are deliberately NOT searched: they are
+#: the training budget, and letting trials differ in budget would confound
+#: "better architecture" with "trained longer".
+LSTM_SEARCH_SPACE: dict = {
+    "lookback":    [5, 10, 20, 40],
+    "hidden_size": [16, 32, 64],
+    "num_layers":  [1, 2],
+    "dropout":     (0.0, 0.4),
+    "lr":          (1e-4, 1e-2),
+    "batch_size":  [32, 64, 128],
+}
+
+#: Hyperparameters the search may set. Everything else is fixed by construction.
+LSTM_TUNABLE: tuple[str, ...] = tuple(LSTM_SEARCH_SPACE)
+
+
+def _optuna_tune_lstm(
+    seq_builder,
+    *,
+    n_trials: int,
+    seed: int,
+    max_epochs: int,
+    patience: int,
+    val_fraction: float,
+    device: torch.device,
+    search_space: dict | None = None,
+    n_jobs: int = 1,
+) -> dict:
+    """
+    Tune the network on a chronological hold-out carved from the training
+    window, mirroring what `_optuna_tune` does for XGBoost.
+
+    The split is NESTED, and has to be. `_fit_network` already holds out the
+    last `val_fraction` of whatever it is given for early stopping; scoring
+    trials on that same tail would select hyperparameters on the data used to
+    decide when to stop training, which flatters every trial that happened to
+    stop at a lucky epoch. So the training window is cut 80/20 in time, trials
+    train on the first 80% (inside which early stopping takes its own tail) and
+    are scored on the last 20%, which no trial has trained on or stopped on.
+    The winning configuration is then refitted on the whole window by the
+    caller, exactly as the XGBoost path does.
+
+    `seq_builder(lookback) -> (X, y)` is supplied by the caller because the
+    hybrid builds its sequences differently from the standalone model (it
+    carries the GARCH forecast as an extra channel), and because `lookback` is
+    itself searched, so the sequences must be rebuilt per trial.
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    space = search_space or LSTM_SEARCH_SPACE
+
+    def objective(trial) -> float:
+        hp = {
+            "lookback":    trial.suggest_categorical("lookback", space["lookback"]),
+            "hidden_size": trial.suggest_categorical("hidden_size", space["hidden_size"]),
+            "num_layers":  trial.suggest_categorical("num_layers", space["num_layers"]),
+            "dropout":     trial.suggest_float("dropout", *space["dropout"]),
+            "lr":          trial.suggest_float("lr", *space["lr"], log=True),
+            "batch_size":  trial.suggest_categorical("batch_size", space["batch_size"]),
+        }
+        X, y = seq_builder(hp["lookback"])
+        split = int(len(X) * 0.8)
+        if split < 30 or len(X) - split < 10:
+            # Too little history for this lookback to leave a usable hold-out.
+            return float("inf")
+        X_tr, X_val = X[:split], X[split:]
+        y_tr, y_val = y[:split], y[split:]
+
+        net = _fit_network(
+            X_tr, y_tr, n_features=X.shape[-1],
+            hidden_size=hp["hidden_size"], num_layers=hp["num_layers"],
+            dropout=hp["dropout"], lr=hp["lr"], max_epochs=max_epochs,
+            patience=patience, batch_size=hp["batch_size"],
+            val_fraction=val_fraction, seed=seed, device=device,
+        )
+        pred = _predict_batch(net, X_val, device)
+        return float(np.mean((pred - y_val) ** 2))
+
+    study = optuna.create_study(
+        direction="minimize", sampler=optuna.samplers.TPESampler(seed=seed)
+    )
+    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=False)
+    return dict(study.best_params)
+
+
+class _TunableLSTM:
+    """
+    Shared tuning plumbing for the standalone and hybrid LSTM models.
+
+    The resolved hyperparameters are written back onto the instance in fit(),
+    so every later use of self.lookback, self.hidden_size and the rest —
+    including update() and the forecast window — picks them up without any
+    further threading. Constructor values are therefore the DEFAULTS and the
+    starting point, not necessarily the values a fitted model ran with; read
+    them back off the fitted instance, or off `.tuning_cache`.
+
+    Mutation does not leak between re-estimations: RollingEvaluator builds a
+    fresh model each time, and under tune="first" the shared cache hands every
+    one of them the same values.
+    """
+
+    def _default_hp(self) -> dict:
+        return {k: getattr(self, k) for k in LSTM_TUNABLE}
+
+    def _apply_hp(self, hp: dict) -> None:
+        for k, v in hp.items():
+            if k in LSTM_TUNABLE:
+                setattr(self, k, v)
+
+    def _resolve_hp(self, seq_builder) -> None:
+        if self.tune == "always":
+            warnings.warn(
+                f"{type(self).__name__} with tune='always' runs a full "
+                f"{self.n_trials}-trial network search at EVERY re-estimation. "
+                f"Over a ~1000-day test period with refit_every=10 that is ~101 "
+                f"searches, which is hours per model. tune='first' is the "
+                f"symmetric counterpart to the XGBoost setting and is what the "
+                f"comparison actually needs.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        hp = resolve_hyperparameters(
+            self.tune,
+            self.tuning_cache,
+            lambda: _optuna_tune_lstm(
+                seq_builder,
+                n_trials=self.n_trials, seed=self.seed,
+                max_epochs=self.max_epochs, patience=self.patience,
+                val_fraction=self.val_fraction, device=self.device,
+            ),
+            self._default_hp(),
+        )
+        self._apply_hp(hp)
+
+
+class LSTMVolatilityModel(_TunableLSTM):
     """
     Standalone LSTM volatility forecaster. Compatible with RollingEvaluator
     (.fit / .forecast_variance interface).
@@ -214,6 +374,9 @@ class LSTMVolatilityModel:
         patience: int = 10,
         batch_size: int = 32,
         val_fraction: float = 0.15,
+        tune: str = "never",
+        tuning_cache: TuningCache | None = None,
+        n_trials: int = 20,
         winsor_limits: tuple[float, float] = (0.01, 0.01),
         retransform: str = "smearing",
         seed: int = 42,
@@ -233,6 +396,9 @@ class LSTMVolatilityModel:
         self.patience      = patience
         self.batch_size    = batch_size
         self.val_fraction  = val_fraction
+        self.tune          = validate_tune(tune)
+        self.tuning_cache  = tuning_cache
+        self.n_trials      = n_trials
         self.winsor_limits = winsor_limits
         self.seed          = seed
         self.device        = _select_device(device)
@@ -274,7 +440,13 @@ class LSTMVolatilityModel:
         self._target_scaler = RobustScaler().fit(log_var.reshape(-1, 1))
         target_scaled = self._target_scaler.transform(log_var.reshape(-1, 1)).ravel()
 
-        X, y = _build_sequences(features_scaled, target_scaled, self.lookback)
+        def _seq(lookback):
+            return _build_sequences(features_scaled, target_scaled, lookback)
+
+        # May run the search and overwrite self.lookback / hidden_size / ...
+        self._resolve_hp(_seq)
+
+        X, y = _seq(self.lookback)
         self._net = _fit_network(
             X, y, n_features=X.shape[-1],
             hidden_size=self.hidden_size, num_layers=self.num_layers,
@@ -326,7 +498,7 @@ class LSTMVolatilityModel:
         )
 
 
-class LSTMHybridModel:
+class LSTMHybridModel(_TunableLSTM):
     """
     Hybrid LSTM + GARCH volatility model. Compatible with RollingEvaluator.
 
@@ -366,6 +538,9 @@ class LSTMHybridModel:
         patience: int = 10,
         batch_size: int = 32,
         val_fraction: float = 0.15,
+        tune: str = "never",
+        tuning_cache: TuningCache | None = None,
+        n_trials: int = 20,
         winsor_limits: tuple[float, float] = (0.01, 0.01),
         retransform: str = "smearing",
         seed: int = 42,
@@ -392,6 +567,9 @@ class LSTMHybridModel:
         self.patience         = patience
         self.batch_size       = batch_size
         self.val_fraction     = val_fraction
+        self.tune             = validate_tune(tune)
+        self.tuning_cache     = tuning_cache
+        self.n_trials         = n_trials
         self.winsor_limits    = winsor_limits
         self.seed             = seed
         self.device           = _select_device(device)
@@ -457,20 +635,27 @@ class LSTMHybridModel:
             self._target_scaler = RobustScaler().fit(log_var.reshape(-1, 1))
             target_scaled = self._target_scaler.transform(log_var.reshape(-1, 1)).ravel()
 
-            rows, targets = [], []
-            for i in range(self.lookback, n - 1):
-                seq = base_scaled[i - self.lookback + 1 : i + 1]
-                g_col = np.full((self.lookback, 1), g_scaled[i + 1], dtype=np.float32)
-                rows.append(np.hstack([seq, g_col]))
-                targets.append(target_scaled[i + 1])
-            X = np.array(rows, dtype=np.float32)
-            y = np.array(targets, dtype=np.float32)
+            def _seq(lookback):
+                rows, targets = [], []
+                for i in range(lookback, n - 1):
+                    seq = base_scaled[i - lookback + 1 : i + 1]
+                    g_col = np.full((lookback, 1), g_scaled[i + 1], dtype=np.float32)
+                    rows.append(np.hstack([seq, g_col]))
+                    targets.append(target_scaled[i + 1])
+                return (np.array(rows, dtype=np.float32),
+                        np.array(targets, dtype=np.float32))
         else:  # residual
             residual = y_raw - g_var
             self._target_scaler = RobustScaler().fit(residual.reshape(-1, 1))
             target_scaled = self._target_scaler.transform(residual.reshape(-1, 1)).ravel()
-            X, y = _build_sequences(base_scaled, target_scaled, self.lookback)
 
+            def _seq(lookback):
+                return _build_sequences(base_scaled, target_scaled, lookback)
+
+        # May run the search and overwrite self.lookback / hidden_size / ...
+        self._resolve_hp(_seq)
+
+        X, y = _seq(self.lookback)
         self._net = _fit_network(
             X, y, n_features=X.shape[-1],
             hidden_size=self.hidden_size, num_layers=self.num_layers,

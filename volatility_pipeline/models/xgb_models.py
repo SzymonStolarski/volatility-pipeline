@@ -5,6 +5,7 @@ import xgboost as xgb
 
 from .garch_models import GARCHModel
 from .targets import log_variance_target, resolve_target, smearing_factor
+from .tuning import TuningCache, resolve_hyperparameters, validate_tune
 
 
 _DEFAULT_XGB_PARAMS: dict = {
@@ -90,7 +91,8 @@ class XGBVolatilityModel:
         self,
         n_lags: int = 5,
         use_returns: bool = True,
-        use_optuna: bool = False,
+        tune: str = "never",
+        tuning_cache: TuningCache | None = None,
         n_trials: int = 50,
         optuna_n_jobs: int = 1,
         xgb_params: dict | None = None,
@@ -105,7 +107,12 @@ class XGBVolatilityModel:
             )
         self.n_lags         = n_lags
         self.use_returns    = use_returns
-        self.use_optuna     = use_optuna
+        self.tune           = validate_tune(tune)
+        # Deliberately NOT auto-created: under RollingEvaluator the cache must be
+        # SHARED across the instances it builds per re-estimation, and a
+        # per-instance one would make tune="first" behave like "always" without
+        # saying so. Build factories with tuning.tuned_factory.
+        self.tuning_cache   = tuning_cache
         self.n_trials       = n_trials
         self.optuna_n_jobs  = optuna_n_jobs
         self.xgb_params     = dict(xgb_params or _DEFAULT_XGB_PARAMS)
@@ -129,10 +136,10 @@ class XGBVolatilityModel:
         X, y = self._build_features(sq, r, y_raw)
         if self.log_target:
             y = log_variance_target(y, self.target_floor_q)
-        params = (
-            _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs)
-            if self.use_optuna
-            else {**self.xgb_params, "random_state": self.seed, "verbosity": 0}
+        params = resolve_hyperparameters(
+            self.tune, self.tuning_cache,
+            lambda: _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs),
+            {**self.xgb_params, "random_state": self.seed, "verbosity": 0},
         )
         self._model = xgb.XGBRegressor(**params)
         self._model.fit(X, y)
@@ -191,7 +198,7 @@ class XGBVolatilityModel:
     def __repr__(self) -> str:
         return (
             f"XGBVolatilityModel(n_lags={self.n_lags}, "
-            f"use_returns={self.use_returns}, use_optuna={self.use_optuna})"
+            f"use_returns={self.use_returns}, tune={self.tune!r})"
         )
 
 
@@ -221,7 +228,8 @@ class XGBHybridModel:
         mode: str = "features",
         n_lags: int = 5,
         use_returns: bool = True,
-        use_optuna: bool = False,
+        tune: str = "never",
+        tuning_cache: TuningCache | None = None,
         n_trials: int = 50,
         optuna_n_jobs: int = 1,
         xgb_params: dict | None = None,
@@ -243,7 +251,8 @@ class XGBHybridModel:
         self.mode             = mode
         self.n_lags           = n_lags
         self.use_returns      = use_returns
-        self.use_optuna       = use_optuna
+        self.tune             = validate_tune(tune)
+        self.tuning_cache     = tuning_cache
         self.n_trials         = n_trials
         self.optuna_n_jobs    = optuna_n_jobs
         self.xgb_params       = dict(xgb_params or _DEFAULT_XGB_PARAMS)
@@ -294,10 +303,10 @@ class XGBHybridModel:
         if self.log_target:
             y = log_variance_target(y, self.target_floor_q)
 
-        params = (
-            _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs)
-            if self.use_optuna
-            else {**self.xgb_params, "random_state": self.seed, "verbosity": 0}
+        params = resolve_hyperparameters(
+            self.tune, self.tuning_cache,
+            lambda: _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs),
+            {**self.xgb_params, "random_state": self.seed, "verbosity": 0},
         )
         self._xgb = xgb.XGBRegressor(**params)
         self._xgb.fit(X, y)
@@ -354,5 +363,5 @@ class XGBHybridModel:
     def __repr__(self) -> str:
         return (
             f"XGBHybridModel(garch={self.garch_model_type}-{self.garch_dist}, "
-            f"mode={self.mode!r}, n_lags={self.n_lags}, use_optuna={self.use_optuna})"
+            f"mode={self.mode!r}, n_lags={self.n_lags}, tune={self.tune!r})"
         )
