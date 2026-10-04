@@ -145,7 +145,8 @@ def prepare_series(
     train_end     : last date of the initial training window. The floor is
                     fitted on data up to here and nowhere else.
     roll_rule     : ticker in ROLL_RULES ('NG=F', 'BZ=F') or rule name. Required
-                    unless roll_handling='none'.
+                    unless roll_handling='none', where an unknown instrument only
+                    means no roll-day report.
     roll_handling : 'adjust' (main), 'drop' (robustness) or 'none' (pre-October).
     floor_q       : quantile of positive training values used as the floor;
                     None disables the floor.
@@ -156,7 +157,13 @@ def prepare_series(
 
     rule = None
     if roll_rule is not None:
-        rule = resolve_roll_rule(roll_rule)
+        try:
+            rule = resolve_roll_rule(roll_rule)
+        except ValueError:
+            # 'none' applies no treatment, so an instrument without a rule only
+            # loses the roll-day report; any other mode needs the calendar.
+            if roll_handling != "none":
+                raise
     elif roll_handling != "none":
         raise ValueError(
             f"roll_handling={roll_handling!r} needs roll_rule (a ticker such as 'NG=F' "

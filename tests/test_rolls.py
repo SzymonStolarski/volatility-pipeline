@@ -330,6 +330,12 @@ def test_prepare_series_validates_its_arguments(calendar, ng_rolls):
     with pytest.raises(ValueError, match="roll_handling"):
         prepare_series(o, h, l, c, proxies=[], train_end=TRAIN_END, roll_rule="NG=F",
                        roll_handling="exclude")
+    with pytest.raises(ValueError, match="no contract-roll rule"):
+        prepare_series(o, h, l, c, proxies=[], train_end=TRAIN_END, roll_rule="CL=F")
+    # 'none' needs no calendar: an unknown instrument just has no roll report
+    ps = prepare_series(o, h, l, c, proxies=[], train_end=TRAIN_END, roll_rule="CL=F",
+                        roll_handling="none")
+    assert ps.roll_report is None
 
 
 def test_to_period_index_keeps_values(calendar, ng_rolls):
