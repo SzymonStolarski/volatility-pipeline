@@ -306,6 +306,10 @@ class _TunableLSTM:
     one of them the same values.
     """
 
+    def _target_floor_q(self) -> float:
+        q = getattr(self, "target_floor_q", None)
+        return self.winsor_limits[0] if q is None else q
+
     def _default_hp(self) -> dict:
         return {k: getattr(self, k) for k in LSTM_TUNABLE}
 
@@ -378,6 +382,7 @@ class LSTMVolatilityModel(_TunableLSTM):
         tuning_cache: TuningCache | None = None,
         n_trials: int = 20,
         winsor_limits: tuple[float, float] = (0.01, 0.01),
+        target_floor_q: float | None = None,
         retransform: str = "smearing",
         seed: int = 42,
         device: str | None = None,
@@ -400,6 +405,11 @@ class LSTMVolatilityModel(_TunableLSTM):
         self.tuning_cache  = tuning_cache
         self.n_trials      = n_trials
         self.winsor_limits = winsor_limits
+        # Lower-tail floor of the log target. None keeps the historical
+        # behaviour (winsor_limits[0]); 0.0 defers to a floor already applied
+        # to the target series at data preparation (prepare_series), which
+        # makes this one a no-op.
+        self.target_floor_q = target_floor_q
         self.seed          = seed
         self.device        = _select_device(device)
 
@@ -436,7 +446,7 @@ class LSTMVolatilityModel(_TunableLSTM):
         self._feature_scaler = RobustScaler().fit(features)
         features_scaled = self._feature_scaler.transform(features)
 
-        log_var = log_variance_target(y_raw, self.winsor_limits[0])
+        log_var = log_variance_target(y_raw, self._target_floor_q())
         self._target_scaler = RobustScaler().fit(log_var.reshape(-1, 1))
         target_scaled = self._target_scaler.transform(log_var.reshape(-1, 1)).ravel()
 
@@ -542,6 +552,7 @@ class LSTMHybridModel(_TunableLSTM):
         tuning_cache: TuningCache | None = None,
         n_trials: int = 20,
         winsor_limits: tuple[float, float] = (0.01, 0.01),
+        target_floor_q: float | None = None,
         retransform: str = "smearing",
         seed: int = 42,
         device: str | None = None,
@@ -571,6 +582,7 @@ class LSTMHybridModel(_TunableLSTM):
         self.tuning_cache     = tuning_cache
         self.n_trials         = n_trials
         self.winsor_limits    = winsor_limits
+        self.target_floor_q   = target_floor_q   # see LSTMVolatilityModel
         self.seed             = seed
         self.device           = _select_device(device)
 
@@ -631,7 +643,7 @@ class LSTMHybridModel(_TunableLSTM):
             self._garch_scaler = RobustScaler().fit(log_g.reshape(-1, 1))
             g_scaled = self._garch_scaler.transform(log_g.reshape(-1, 1)).ravel()
 
-            log_var = log_variance_target(y_raw, self.winsor_limits[0])
+            log_var = log_variance_target(y_raw, self._target_floor_q())
             self._target_scaler = RobustScaler().fit(log_var.reshape(-1, 1))
             target_scaled = self._target_scaler.transform(log_var.reshape(-1, 1)).ravel()
 
