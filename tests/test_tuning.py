@@ -172,6 +172,7 @@ LSTM_KW = dict(n_trials=2, seed=1, max_epochs=8, patience=3, device="cpu")
 
 def test_lstm_search_space_is_complete():
     assert set(LSTM_TUNABLE) == set(LSTM_SEARCH_SPACE)
+    assert "lookback" not in LSTM_SEARCH_SPACE   # information set, not a hyperparameter
     # everything searched must be a real constructor argument
     m = LSTMVolatilityModel()
     for name in LSTM_TUNABLE:
@@ -181,9 +182,9 @@ def test_lstm_search_space_is_complete():
 def test_lstm_tuning_picks_values_from_the_space(data):
     train, _, _ = data
     cache = TuningCache()
-    m = LSTMVolatilityModel(tune="first", tuning_cache=cache, **LSTM_KW).fit(train)
+    m = LSTMVolatilityModel(tune="first", tuning_cache=cache, lookback=10, **LSTM_KW).fit(train)
     assert cache.n_searches == 1
-    assert m.lookback in LSTM_SEARCH_SPACE["lookback"]
+    assert m.lookback == 10, "the search must not move the lookback"
     assert m.hidden_size in LSTM_SEARCH_SPACE["hidden_size"]
     assert m.num_layers in LSTM_SEARCH_SPACE["num_layers"]
     assert 0.0 <= m.dropout <= 0.4
@@ -192,16 +193,19 @@ def test_lstm_tuning_picks_values_from_the_space(data):
 
 
 def test_lstm_tuning_is_applied_to_the_instance(data):
-    """The resolved values must be written back, since update() and the forecast
-    window read self.lookback rather than anything the search returns."""
+    """The resolved values must be written back onto the instance, and a
+    lookback found in a cache (say, one recorded by older code) must be ignored:
+    the lookback is the information set and stays at the constructor value."""
     train, _, _ = data
     cache = TuningCache()
     cache.record({"lookback": 5, "hidden_size": 16, "num_layers": 1,
                   "dropout": 0.1, "lr": 1e-3, "batch_size": 32})
-    m = LSTMVolatilityModel(tune="first", tuning_cache=cache, lookback=40, **LSTM_KW)
+    m = LSTMVolatilityModel(tune="first", tuning_cache=cache, lookback=10,
+                            hidden_size=64, **LSTM_KW)
     m.fit(train)
-    assert m.lookback == 5, "cached lookback not applied"
-    assert m._last_window.shape[0] == 5, "forecast window still uses the old lookback"
+    assert m.hidden_size == 16, "cached hyperparameters not applied"
+    assert m.lookback == 10, "a cached lookback must not override the information set"
+    assert m._last_window.shape[0] == 10
 
 
 def test_lstm_never_leaves_constructor_values_untouched(data):
@@ -235,9 +239,10 @@ def test_lstm_hybrid_tunes_in_both_modes(data, mode):
     """The hybrids inherit the asymmetry, so they must inherit the fix."""
     train, _, _ = data
     cache = TuningCache()
-    m = LSTMHybridModel(mode=mode, tune="first", tuning_cache=cache, **LSTM_KW).fit(train)
+    m = LSTMHybridModel(mode=mode, tune="first", tuning_cache=cache, lookback=10,
+                        **LSTM_KW).fit(train)
     assert cache.n_searches == 1
-    assert m.lookback in LSTM_SEARCH_SPACE["lookback"]
+    assert m.lookback == 10
     fc = m.forecast_variance(1)[0]
     assert np.isfinite(fc) and fc > 0
 
