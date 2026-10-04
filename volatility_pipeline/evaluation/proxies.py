@@ -35,8 +35,12 @@ days with |gap| > 15% carry 47.4% of the entire overnight sum; the worst
 0.476 against a Garman-Klass reading of 5.76e-4 for the same day, a factor of
 about 830. Garman-Klass is immune because it never crosses the gap.
 
-Run `overnight_gap_report` before adopting any overnight-inclusive proxy on a
-futures series, and either roll-adjust the prices or exclude the roll dates.
+The roll days are identified from the exchange calendar in
+`volatility_pipeline.data.rolls`, and `compute_proxy(..., roll_days=...)` drops
+the overnight term on those days. The same spread also sits in the
+close-to-close RETURNS, so the returns need the matching treatment; build every
+series through `volatility_pipeline.data.prepare_series`, which applies one rule
+to the returns, every proxy and the floor at once.
 
 ON YANG-ZHANG
 -------------
@@ -132,7 +136,11 @@ def rogers_satchell(
 # The overnight component
 # ---------------------------------------------------------------------------
 
-def overnight_variance(open_: pd.Series, close: pd.Series) -> pd.Series:
+def overnight_variance(
+    open_: pd.Series,
+    close: pd.Series,
+    roll_days: pd.DatetimeIndex | None = None,
+) -> pd.Series:
     """
     Squared overnight (close-to-open) return, (ln O_t / C_{t-1})².
 
@@ -144,12 +152,17 @@ def overnight_variance(open_: pd.Series, close: pd.Series) -> pd.Series:
     index: the returns series drops its own first day, so reindexing before
     shifting would silently discard the first usable overnight observation.
 
-    On futures, read the module docstring's warning about contract rolls before
-    using this — on a roll date this is a change of contract, not a price move.
+    On futures, a roll date's gap is a change of contract, not a price move.
+    Pass `roll_days` to set the term to 0 on those dates: what remains for the
+    day is the intraday session, which lies entirely within the new contract.
     """
     prev_close = close.shift(1)
     on = np.log(open_.values / prev_close.values) ** 2
-    return pd.Series(on, index=close.index, name="overnight_variance")
+    out = pd.Series(on, index=close.index, name="overnight_variance")
+    if roll_days is not None:
+        on_roll = close.index.isin(pd.DatetimeIndex(roll_days)) & out.notna().to_numpy()
+        out = out.mask(on_roll, 0.0)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +185,7 @@ def garman_klass_overnight(
     high: pd.Series,
     low: pd.Series,
     close: pd.Series,
+    roll_days: pd.DatetimeIndex | None = None,
 ) -> pd.Series:
     """
     Garman-Klass plus the squared overnight return — a per-day estimator of the
@@ -179,9 +193,10 @@ def garman_klass_overnight(
     model estimated on close-to-close returns forecasts.
 
     First observation is NaN (no preceding close for the overnight term).
+    `roll_days`: see `overnight_variance`.
     """
     gk = garman_klass(open_, high, low, close)
-    on = overnight_variance(open_, close)
+    on = overnight_variance(open_, close, roll_days)
     return (gk + on).rename("garman_klass_overnight")
 
 
@@ -190,6 +205,7 @@ def rogers_satchell_overnight(
     high: pd.Series,
     low: pd.Series,
     close: pd.Series,
+    roll_days: pd.DatetimeIndex | None = None,
 ) -> pd.Series:
     """
     Rogers-Satchell plus the squared overnight return.
@@ -200,9 +216,10 @@ def rogers_satchell_overnight(
     estimates over a window, without Yang-Zhang's multi-day construction.
 
     First observation is NaN (no preceding close for the overnight term).
+    `roll_days`: see `overnight_variance`.
     """
     rs = rogers_satchell(open_, high, low, close)
-    on = overnight_variance(open_, close)
+    on = overnight_variance(open_, close, roll_days)
     return (rs + on).rename("rogers_satchell_overnight")
 
 
@@ -361,6 +378,7 @@ def compute_proxy(
     high: pd.Series | None = None,
     low: pd.Series | None = None,
     close: pd.Series | None = None,
+    roll_days: pd.DatetimeIndex | None = None,
 ) -> pd.Series:
     """
     Build the named per-day variance proxy and align it to `returns.index`.
@@ -374,6 +392,13 @@ def compute_proxy(
     `yang_zhang` is deliberately absent from the registry — it is a multi-day
     estimator and must not be used to score one-step-ahead forecasts. Call it
     directly if you want it for description.
+
+    `roll_days` sets the overnight term to 0 on contract-roll dates for the
+    *_overnight proxies. Intraday proxies never read the overnight gap and
+    ignore it. `squared` is built from the `returns` passed in, so for it the
+    returns themselves must already be roll-adjusted — which is why
+    `volatility_pipeline.data.prepare_series`, not this function, is the place
+    to build a consistent set.
     """
     if name not in PROXY_REGISTRY:
         extra = (
@@ -386,7 +411,7 @@ def compute_proxy(
             f"{sorted(PROXY_REGISTRY)}.{extra}"
         )
 
-    func, needs_ohlc, _ = PROXY_REGISTRY[name]
+    func, needs_ohlc, includes_overnight = PROXY_REGISTRY[name]
 
     if not needs_ohlc:
         proxy = func(returns)
@@ -399,10 +424,12 @@ def compute_proxy(
                 f"proxy {name!r} is range-based and needs OHLC data; "
                 f"missing: {', '.join(missing)}."
             )
-        proxy = (
-            func(high, low) if func is parkinson
-            else func(open_, high, low, close)
-        )
+        if func is parkinson:
+            proxy = func(high, low)
+        elif includes_overnight:
+            proxy = func(open_, high, low, close, roll_days)
+        else:
+            proxy = func(open_, high, low, close)
 
     aligned = proxy.reindex(returns.index)
     if not np.isfinite(aligned.to_numpy(dtype=float)).all():
@@ -414,3 +441,41 @@ def compute_proxy(
             f"undefined — pass the full OHLC history instead of a slice."
         )
     return aligned.rename(name)
+
+
+# ---------------------------------------------------------------------------
+# Floor
+# ---------------------------------------------------------------------------
+
+def floor_proxy(proxy: pd.Series, q: float, fit_end) -> tuple[pd.Series, float]:
+    """
+    Raise every value below a floor to the floor, with the floor fitted on the
+    training window only.
+
+    floor = q-quantile of the strictly POSITIVE values dated <= `fit_end`.
+
+    Why positive values only: on BZ=F 1.06% of the training-window
+    Garman-Klass+overnight values are <= 0 (80 zero-range OHLC records and a few
+    internally inconsistent ones, all before 2020), so a plain 1% quantile is
+    0.0 and the floor would floor nothing. Why the training window: the floor is
+    a modelling choice and must not use test-period data.
+
+    Applied once, at data preparation, the same floored series serves as the
+    scoring proxy, the ML training target and the Realized GARCH measure, so the
+    three cannot disagree about any day. On this project's data it changes no
+    test-window value on either commodity; it matters for the log transforms in
+    the ML target and the Realized GARCH measurement equation.
+
+    Returns (floored series, floor value).
+    """
+    if not 0.0 < q < 1.0:
+        raise ValueError(f"floor quantile must lie in (0, 1), got {q!r}.")
+    fit = proxy[proxy.index <= fit_end]
+    positive = fit[fit > 0].to_numpy(dtype=float)
+    if positive.size == 0:
+        raise ValueError(
+            f"proxy {proxy.name!r} has no positive values on or before {fit_end}; "
+            f"cannot fit a floor."
+        )
+    floor = float(np.quantile(positive, q))
+    return proxy.clip(lower=floor), floor
