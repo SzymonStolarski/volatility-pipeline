@@ -190,11 +190,16 @@ def _predict_batch(
 #: network, so this is 30-60x more expensive per trial than the XGBoost search,
 #: and a wide space would buy noise rather than fit.
 #:
-#: lookback    how many days feed each prediction. Volatility is persistent, so
-#:             this trades signal against sample size — a longer window means
-#:             fewer training sequences from the same history. Together with
-#:             hidden_size it is the choice most likely to actually change the
-#:             forecasts.
+#: The LOOKBACK IS NOT SEARCHED, and must not be. It is the number of lagged
+#: returns and lagged squared returns each prediction sees (every timestep
+#: carries [r, r^2]), i.e. the model's INFORMATION SET, not a capacity or
+#: optimisation setting. The frozen specification gives both ML families the
+#: same one — 10 lagged returns and 10 lagged squared returns — as the condition
+#: for a fair comparison of model classes; XGBoost's n_lags is fixed for the
+#: same reason and is not in its search either. Searching it would let the LSTM
+#: pick a longer history than XGBoost on validation data. `_optuna_tune_lstm`
+#: rejects a search space that contains it.
+#:
 #: hidden_size capacity. With ~3,000 daily observations anything past 64 has far
 #:             more parameters than the data can identify.
 #: num_layers  depth. Note that dropout between layers only exists when this is
@@ -208,7 +213,6 @@ def _predict_batch(
 #: the training budget, and letting trials differ in budget would confound
 #: "better architecture" with "trained longer".
 LSTM_SEARCH_SPACE: dict = {
-    "lookback":    [5, 10, 20, 40],
     "hidden_size": [16, 32, 64],
     "num_layers":  [1, 2],
     "dropout":     (0.0, 0.4),
@@ -219,9 +223,14 @@ LSTM_SEARCH_SPACE: dict = {
 #: Hyperparameters the search may set. Everything else is fixed by construction.
 LSTM_TUNABLE: tuple[str, ...] = tuple(LSTM_SEARCH_SPACE)
 
+#: Fixed by the specification, never tuned: they define what the model sees
+#: (lookback) or how long it trains (the budget). See the note above.
+LSTM_NOT_TUNABLE: tuple[str, ...] = ("lookback", "max_epochs", "patience", "val_fraction")
+
 
 def _optuna_tune_lstm(
-    seq_builder,
+    X: np.ndarray,
+    y: np.ndarray,
     *,
     n_trials: int,
     seed: int,
@@ -246,33 +255,42 @@ def _optuna_tune_lstm(
     The winning configuration is then refitted on the whole window by the
     caller, exactly as the XGBoost path does.
 
-    `seq_builder(lookback) -> (X, y)` is supplied by the caller because the
-    hybrid builds its sequences differently from the standalone model (it
-    carries the GARCH forecast as an extra channel), and because `lookback` is
-    itself searched, so the sequences must be rebuilt per trial.
+    `X, y` are the training sequences, built by the caller at the model's
+    FIXED lookback (the hybrid builds them differently: it carries the GARCH
+    forecast as an extra channel). The lookback is not searched, so the
+    sequences are the same for every trial.
     """
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     space = search_space or LSTM_SEARCH_SPACE
+    forbidden = sorted(set(space) & set(LSTM_NOT_TUNABLE))
+    if forbidden:
+        raise ValueError(
+            f"{forbidden} cannot be searched: the lookback is the number of "
+            f"lagged returns and lagged squared returns the model sees (its "
+            f"information set, fixed by the specification and shared with "
+            f"XGBoost's n_lags), and max_epochs/patience/val_fraction are the "
+            f"training budget. Set them on the model instead."
+        )
+
+    split = int(len(X) * 0.8)
+    if split < 30 or len(X) - split < 10:
+        raise ValueError(
+            f"too little history to tune: {len(X)} training sequences leave no "
+            f"usable chronological hold-out."
+        )
+    X_tr, X_val = X[:split], X[split:]
+    y_tr, y_val = y[:split], y[split:]
 
     def objective(trial) -> float:
         hp = {
-            "lookback":    trial.suggest_categorical("lookback", space["lookback"]),
             "hidden_size": trial.suggest_categorical("hidden_size", space["hidden_size"]),
             "num_layers":  trial.suggest_categorical("num_layers", space["num_layers"]),
             "dropout":     trial.suggest_float("dropout", *space["dropout"]),
             "lr":          trial.suggest_float("lr", *space["lr"], log=True),
             "batch_size":  trial.suggest_categorical("batch_size", space["batch_size"]),
         }
-        X, y = seq_builder(hp["lookback"])
-        split = int(len(X) * 0.8)
-        if split < 30 or len(X) - split < 10:
-            # Too little history for this lookback to leave a usable hold-out.
-            return float("inf")
-        X_tr, X_val = X[:split], X[split:]
-        y_tr, y_val = y[:split], y[split:]
-
         net = _fit_network(
             X_tr, y_tr, n_features=X.shape[-1],
             hidden_size=hp["hidden_size"], num_layers=hp["num_layers"],
@@ -294,12 +312,14 @@ class _TunableLSTM:
     """
     Shared tuning plumbing for the standalone and hybrid LSTM models.
 
-    The resolved hyperparameters are written back onto the instance in fit(),
-    so every later use of self.lookback, self.hidden_size and the rest —
-    including update() and the forecast window — picks them up without any
-    further threading. Constructor values are therefore the DEFAULTS and the
-    starting point, not necessarily the values a fitted model ran with; read
-    them back off the fitted instance, or off `.tuning_cache`.
+    The resolved hyperparameters (LSTM_TUNABLE) are written back onto the
+    instance in fit(), so every later use of self.hidden_size and the rest picks
+    them up without any further threading. Constructor values of those are
+    therefore the DEFAULTS and the starting point, not necessarily the values a
+    fitted model ran with; read them back off the fitted instance, or off
+    `.tuning_cache`. The lookback is never among them: it is the information set
+    (lagged returns and lagged squared returns) and stays at the constructor
+    value whatever the tuning cadence.
 
     Mutation does not leak between re-estimations: RollingEvaluator builds a
     fresh model each time, and under tune="first" the shared cache hands every
@@ -334,7 +354,7 @@ class _TunableLSTM:
             self.tune,
             self.tuning_cache,
             lambda: _optuna_tune_lstm(
-                seq_builder,
+                *seq_builder(self.lookback),
                 n_trials=self.n_trials, seed=self.seed,
                 max_epochs=self.max_epochs, patience=self.patience,
                 val_fraction=self.val_fraction, device=self.device,
@@ -453,7 +473,7 @@ class LSTMVolatilityModel(_TunableLSTM):
         def _seq(lookback):
             return _build_sequences(features_scaled, target_scaled, lookback)
 
-        # May run the search and overwrite self.lookback / hidden_size / ...
+        # May run the search and overwrite hidden_size / num_layers / ... (never lookback)
         self._resolve_hp(_seq)
 
         X, y = _seq(self.lookback)
@@ -664,7 +684,7 @@ class LSTMHybridModel(_TunableLSTM):
             def _seq(lookback):
                 return _build_sequences(base_scaled, target_scaled, lookback)
 
-        # May run the search and overwrite self.lookback / hidden_size / ...
+        # May run the search and overwrite hidden_size / num_layers / ... (never lookback)
         self._resolve_hp(_seq)
 
         X, y = _seq(self.lookback)

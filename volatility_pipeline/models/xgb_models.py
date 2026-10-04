@@ -36,6 +36,12 @@ def _optuna_tune(
     """
     Tune XGBRegressor via Optuna on an 80/20 time-series holdout split.
 
+    Only the booster's own settings are searched. The feature set — n_lags
+    lagged squared returns and n_lags lagged returns — is already built into X
+    and is deliberately NOT a search dimension: it is the model's information
+    set, fixed by the specification and shared with the LSTM's lookback, so
+    that neither ML family can choose a longer history on validation data.
+
     Parameters
     ----------
     n_jobs : parallel Optuna workers (1 → sequential trials).
@@ -81,7 +87,8 @@ class XGBVolatilityModel:
     """
     Standalone XGBoost volatility forecaster.
 
-    Features: n_lags of lagged squared returns; optionally also lagged raw returns.
+    Features: n_lags of lagged squared returns; with use_returns=True (the
+    specification) also n_lags of lagged returns. n_lags is fixed, never tuned.
     Target:   the next-step realized-variance proxy supplied by the caller
               (see `fit`), falling back to squared returns.
     Compatible with RollingEvaluator (.fit / .update / .forecast_variance).
