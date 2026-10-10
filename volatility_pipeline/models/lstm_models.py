@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import RobustScaler
 
-from .garch_models import GARCHModel
+from .garch_models import GARCHInputs, GARCHModel
 from .tuning import TuningCache, chrono_split, resolve_hyperparameters, validate_tune
 from .targets import (
     _EPS,
@@ -538,12 +538,18 @@ class LSTMHybridModel(_TunableLSTM):
     Hybrid LSTM + GARCH volatility model. Compatible with RollingEvaluator.
 
     mode='features':
-        Inputs at each timestep are [return, squared_return] plus the GARCH
-        one-step-ahead forecast h_{t+1|t} (log-scaled), broadcast across every
-        timestep of the lookback window. Final forecast = LSTM output
-        (inverse-scaled, exponentiated, retransformation-corrected).
+        Inputs at each timestep are [return, squared_return] plus the one-step-
+        ahead forecast h_{t+1|t} (log-scaled) of every GARCH specification in
+        `garch_specs`, each broadcast across every timestep of the lookback
+        window. Final forecast = LSTM output (inverse-scaled, exponentiated,
+        retransformation-corrected).
+          * one specification  -> the single-base hybrid
+          * the GARCH family   -> the COMBINER (the article's hybrid)
+        The forecasts enter as constant channels, i.e. only today's forecasts,
+        so the LSTM sees exactly what the XGBoost combiner sees: the lagged
+        returns and squared returns plus the current GARCH forecasts.
 
-    mode='residual':
+    mode='residual' (one specification only):
         Inputs are [return, squared_return] only (as in the standalone model).
         Target is the GARCH residual: sq[t+1] - h_{t+1|t} (RobustScaler, no log
         transform since residuals can be negative).
@@ -552,9 +558,14 @@ class LSTMHybridModel(_TunableLSTM):
     `retransform` applies to 'features' mode only — see LSTMVolatilityModel.
     'residual' mode is fit on the level scale and needs no correction.
 
-    The internal GARCH model is re-estimated on every .fit() call, so the
-    hybrid model is self-contained and works transparently with
-    RollingEvaluator's expanding/sliding window refitting logic.
+    Training uses each specification's IN-SAMPLE conditional variance
+    h_{t+1|t} (parameters estimated on the training window); forecasting uses
+    its genuine one-step forecast after update(). See GARCHInputs.
+
+    The GARCH models are re-estimated on every .fit() call, so the hybrid is
+    self-contained and works transparently with RollingEvaluator's
+    expanding/sliding window refitting logic. `garch_specs=None` keeps the
+    single-base signature; `asym_order` reaches EGARCH / APARCH as in make_garch.
     """
 
     def __init__(
@@ -581,6 +592,8 @@ class LSTMHybridModel(_TunableLSTM):
         retransform: str = "smearing",
         seed: int = 42,
         device: str | None = None,
+        garch_specs: list | None = None,
+        asym_order: int | None = None,
     ) -> None:
         if mode not in ("features", "residual"):
             raise ValueError(f"mode must be 'features' or 'residual', got {mode!r}")
@@ -589,8 +602,16 @@ class LSTMHybridModel(_TunableLSTM):
                 f"retransform must be 'smearing' or 'none', got {retransform!r}"
             )
         self.retransform      = retransform
-        self.garch_model_type = garch_model_type
-        self.garch_dist       = garch_dist
+        self.garch_specs      = GARCHInputs(
+            garch_specs if garch_specs is not None else [(garch_model_type, garch_dist)]
+        ).specs
+        if mode == "residual" and len(self.garch_specs) != 1:
+            raise ValueError(
+                "mode='residual' needs exactly one GARCH specification: the residual "
+                f"is measured against one base forecast; got {len(self.garch_specs)}."
+            )
+        self.garch_model_type, self.garch_dist = self.garch_specs[0]
+        self.asym_order       = asym_order
         self.garch_p          = garch_p
         self.garch_q          = garch_q
         self.mode             = mode
@@ -611,7 +632,7 @@ class LSTMHybridModel(_TunableLSTM):
         self.seed             = seed
         self.device           = _select_device(device)
 
-        self._garch: GARCHModel | None = None
+        self._inputs: GARCHInputs | None = None
         self._net: _LSTMNet | None = None
         self._feature_scaler: RobustScaler | None = None
         self._garch_scaler:   RobustScaler | None = None  # 'features' mode only
@@ -628,15 +649,29 @@ class LSTMHybridModel(_TunableLSTM):
         sq_w = winsorize(r ** 2, self._sq_bounds)
         return self._feature_scaler.transform(np.column_stack([r_w, sq_w]))
 
+    @property
+    def is_combiner(self) -> bool:
+        return len(self.garch_specs) > 1
+
+    @property
+    def _garch(self) -> GARCHModel | None:
+        """The (first) internal GARCH model — the base of a single-base hybrid."""
+        return self._inputs.models[0] if self._inputs is not None else None
+
+    def garch_forecasts(self) -> pd.Series:
+        """The one-step GARCH forecasts the next prediction will be fed."""
+        if self._inputs is None:
+            raise RuntimeError("Call .fit() first.")
+        return pd.Series(self._inputs.forecasts(), index=self._inputs.names, name="garch_forecast")
+
     def _current_window(self, base_scaled: np.ndarray) -> np.ndarray:
-        """Input window ending at the last observation, with the GARCH channel."""
+        """Input window ending at the last observation, with the GARCH channel(s)."""
         if self.mode != "features":
             return base_scaled[-self.lookback:].astype(np.float32)
-        garch_fc_now = float(self._garch.forecast_variance(horizon=1)[0])
-        log_g_now = np.log(garch_fc_now + _EPS)
-        g_now_scaled = self._garch_scaler.transform([[log_g_now]])[0, 0]
-        g_col = np.full((self.lookback, 1), g_now_scaled, dtype=np.float32)
-        return np.hstack([base_scaled[-self.lookback:], g_col]).astype(np.float32)
+        log_g_now = np.log(self._inputs.forecasts() + _EPS)
+        g_now_scaled = self._garch_scaler.transform(log_g_now.reshape(1, -1))[0]
+        g_cols = np.tile(g_now_scaled.astype(np.float32), (self.lookback, 1))
+        return np.hstack([base_scaled[-self.lookback:], g_cols]).astype(np.float32)
 
     def fit(self, returns: pd.Series, target: pd.Series | None = None) -> "LSTMHybridModel":
         """
@@ -648,11 +683,10 @@ class LSTMHybridModel(_TunableLSTM):
         n  = len(r)
         y_raw = resolve_target(r, None if target is None else np.asarray(target, dtype=float))
 
-        self._garch = GARCHModel(
-            self.garch_model_type, self.garch_dist, self.garch_p, self.garch_q
-        )
-        self._garch.fit(returns)
-        g_var = self._garch.insample_variance().values  # h_{t|t-1}
+        self._inputs = GARCHInputs(
+            self.garch_specs, p=self.garch_p, q=self.garch_q, asym_order=self.asym_order
+        ).fit(returns)
+        g_var = self._inputs.insample_matrix()  # (n, K): h_{t|t-1} per specification
 
         self._r_bounds  = winsor_bounds(r, self.winsor_limits)
         self._sq_bounds = winsor_bounds(sq, self.winsor_limits)
@@ -665,8 +699,8 @@ class LSTMHybridModel(_TunableLSTM):
 
         if self.mode == "features":
             log_g = np.log(g_var + _EPS)
-            self._garch_scaler = RobustScaler().fit(log_g.reshape(-1, 1))
-            g_scaled = self._garch_scaler.transform(log_g.reshape(-1, 1)).ravel()
+            self._garch_scaler = RobustScaler().fit(log_g)      # one scaling per column
+            g_scaled = self._garch_scaler.transform(log_g)
 
             log_var = log_variance_target(y_raw, self._target_floor_q())
             self._target_scaler = RobustScaler().fit(log_var.reshape(-1, 1))
@@ -676,13 +710,14 @@ class LSTMHybridModel(_TunableLSTM):
                 rows, targets = [], []
                 for i in range(lookback, n - 1):
                     seq = base_scaled[i - lookback + 1 : i + 1]
-                    g_col = np.full((lookback, 1), g_scaled[i + 1], dtype=np.float32)
-                    rows.append(np.hstack([seq, g_col]))
+                    # every specification's h_{i+1|i}, constant across the window
+                    g_cols = np.tile(g_scaled[i + 1].astype(np.float32), (lookback, 1))
+                    rows.append(np.hstack([seq, g_cols]))
                     targets.append(target_scaled[i + 1])
                 return (np.array(rows, dtype=np.float32),
                         np.array(targets, dtype=np.float32))
-        else:  # residual
-            residual = y_raw - g_var
+        else:  # residual (single specification)
+            residual = y_raw - g_var[:, 0]
             self._target_scaler = RobustScaler().fit(residual.reshape(-1, 1))
             target_scaled = self._target_scaler.transform(residual.reshape(-1, 1)).ravel()
 
@@ -717,19 +752,19 @@ class LSTMHybridModel(_TunableLSTM):
         Slide the input window forward and roll the GARCH state, without
         retraining either. Scalers and winsorisation bounds stay as fitted.
         """
-        if self._net is None or self._garch is None:
+        if self._net is None or self._inputs is None:
             raise RuntimeError("Call .fit() first.")
         r = np.asarray(returns, dtype=float)
         if len(r) < self.lookback:
             raise ValueError(
                 f"update needs at least lookback={self.lookback} observations, got {len(r)}."
             )
-        self._garch.update(returns)
+        self._inputs.update(returns)
         self._last_window = self._current_window(self._scaled_features(r))
         return self
 
     def forecast_variance(self, horizon: int = 1) -> np.ndarray:
-        if self._net is None or self._garch is None:
+        if self._net is None or self._inputs is None:
             raise RuntimeError("Call .fit() first.")
         pred_scaled = _predict_one(self._net, self._last_window, self.device)
 
@@ -737,7 +772,7 @@ class LSTMHybridModel(_TunableLSTM):
             log_pred = self._target_scaler.inverse_transform([[pred_scaled]])[0, 0]
             result = max(float(np.exp(log_pred)) * self._smearing, 1e-10)
         else:
-            garch_fc = float(self._garch.forecast_variance(horizon=1)[0])
+            garch_fc = float(self._inputs.forecasts()[0])
             residual = self._target_scaler.inverse_transform([[pred_scaled]])[0, 0]
             result = max(garch_fc + float(residual), 1e-10)
 
@@ -746,12 +781,23 @@ class LSTMHybridModel(_TunableLSTM):
     def feature_names(self) -> list[str]:
         names = ["return", "sq_return"]
         if self.mode == "features":
-            names.append("garch_fc")
+            if self.is_combiner:
+                names += [f"fc_{t}-{d.upper()}" for t, d in self.garch_specs]
+            else:
+                names.append("garch_fc")
         return names
 
+    def hyperparameters(self) -> dict:
+        hp = super().hyperparameters()
+        hp["garch_inputs"] = len(self.garch_specs)
+        return hp
+
     def __repr__(self) -> str:
+        base = (
+            f"combiner of {len(self.garch_specs)} GARCH specs" if self.is_combiner
+            else f"garch={self.garch_model_type}-{self.garch_dist}"
+        )
         return (
-            f"LSTMHybridModel(garch={self.garch_model_type}-{self.garch_dist}, "
-            f"mode={self.mode!r}, lookback={self.lookback}, "
+            f"LSTMHybridModel({base}, mode={self.mode!r}, lookback={self.lookback}, "
             f"retransform={self.retransform!r}, device={self.device.type!r})"
         )
