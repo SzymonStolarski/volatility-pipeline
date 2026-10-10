@@ -4,6 +4,28 @@ import pandas as pd
 from dataclasses import dataclass
 
 
+def resolve_block_size(T: int, block_size=None) -> int:
+    """
+    Mean block length of the stationary bootstrap, stated explicitly.
+
+      None or "sqrt"  int(sqrt(T)) — arch.bootstrap.MCS's own default, and so
+                      what the arch p-values reported so far used (31 at T=1004)
+      "cbrt"          round(T ** (1/3)) — the common rate-optimal rule (10)
+      int             used as given
+
+    Both MCS implementations take the block length from here, so they cannot
+    silently use different ones. (Until October 2026 they did: this module
+    defaulted to T^(1/3) while arch used sqrt(T).)
+    """
+    if block_size is None or block_size == "sqrt":
+        return max(1, int(np.sqrt(T)))
+    if block_size == "cbrt":
+        return max(1, int(round(T ** (1.0 / 3.0))))
+    if isinstance(block_size, (int, np.integer)) and block_size >= 1:
+        return int(block_size)
+    raise ValueError(f"block_size must be None, 'sqrt', 'cbrt' or a positive int, got {block_size!r}.")
+
+
 @dataclass
 class MCSResult:
     """Results from the Model Confidence Set procedure."""
@@ -11,6 +33,8 @@ class MCSResult:
     pvalues: dict[str, float]     # MCS p-value per model (> alpha ↔ in MCS)
     alpha: float
     loss: str
+    block_size: int | None = None   # stationary-bootstrap mean block length used
+    n_boot: int | None = None
 
     def summary(self, mark_early_stop: bool = False) -> pd.DataFrame:
         """
@@ -40,6 +64,7 @@ class MCSResult:
     def __repr__(self) -> str:
         return (
             f"MCSResult(alpha={self.alpha}, loss={self.loss!r}, "
+            f"block_size={self.block_size}, n_boot={self.n_boot}, "
             f"n_included={len(self.included)}, models={self.included})"
         )
 
@@ -49,7 +74,7 @@ def mcs(
     loss: str = "squared",
     alpha: float = 0.10,
     n_boot: int = 2000,
-    block_size: int | None = None,
+    block_size: int | str | None = None,
     seed: int = 42,
 ) -> MCSResult:
     """
@@ -68,7 +93,8 @@ def mcs(
     loss       : loss function ('squared', 'absolute', 'qlike')
     alpha      : significance level (0.10 → 90% MCS; 0.25 → 75% MCS)
     n_boot     : bootstrap replications (≥ 1000 recommended)
-    block_size : stationary bootstrap block length (default: T^(1/3))
+    block_size : stationary bootstrap mean block length — see
+                 resolve_block_size (default: int(sqrt(T)), as arch)
     seed       : random seed for reproducibility
 
     Returns
@@ -83,8 +109,7 @@ def mcs(
     )  # shape: T × m
     T = loss_matrix.shape[0]
 
-    if block_size is None:
-        block_size = max(1, int(round(T ** (1.0 / 3.0))))
+    block_size = resolve_block_size(T, block_size)
 
     rng = np.random.default_rng(seed)
     included_idx = list(range(m))
@@ -133,6 +158,8 @@ def mcs(
         pvalues={names[i]: float(pvalues_arr[i]) for i in range(m)},
         alpha=alpha,
         loss=loss,
+        block_size=block_size,
+        n_boot=n_boot,
     )
 
 
@@ -142,9 +169,12 @@ def arch_mcs(
     size: float = 0.10,
     n_boot: int = 2000,
     seed: int = 42,
+    block_size: int | str | None = None,
 ) -> pd.DataFrame:
     """
-    Cross-check MCS using Kevin Sheppard's arch.bootstrap.MCS (T_max statistic).
+    MCS p-values from Kevin Sheppard's arch.bootstrap.MCS (T_max statistic),
+    stationary bootstrap — the implementation whose p-values the article
+    reports.
 
     Run this alongside mcs() to distinguish implementation bugs from substantive
     results.  If both implementations retain the full model set, the issue is a
@@ -160,6 +190,10 @@ def arch_mcs(
     size    : significance level (alpha)
     n_boot  : bootstrap replications
     seed    : random seed
+    block_size : mean block length, see resolve_block_size. None keeps arch's
+                 own default, int(sqrt(T)).
+
+    The block length and replications used are recorded in `.attrs`.
     """
     from arch.bootstrap import MCS as ArchMCS
 
@@ -168,7 +202,9 @@ def arch_mcs(
         {n: results[n].loss_series(loss).values for n in names}
     )
 
-    mcs_obj = ArchMCS(losses_df, size=size, reps=n_boot, method="max", seed=seed)
+    bs = resolve_block_size(len(losses_df), block_size)
+    mcs_obj = ArchMCS(losses_df, size=size, reps=n_boot, block_size=bs,
+                      method="max", seed=seed)
     mcs_obj.compute()
 
     pv = mcs_obj.pvalues
@@ -176,7 +212,9 @@ def arch_mcs(
         pv = pv.iloc[:, 0]
     df = pd.DataFrame({"mcs_pvalue": pv})
     df["in_mcs"] = df["mcs_pvalue"] > size
-    return df.sort_values("mcs_pvalue", ascending=False)
+    df = df.sort_values("mcs_pvalue", ascending=False)
+    df.attrs.update(block_size=bs, n_boot=n_boot, size=size, loss=loss)
+    return df
 
 
 def _stationary_bootstrap_means(
