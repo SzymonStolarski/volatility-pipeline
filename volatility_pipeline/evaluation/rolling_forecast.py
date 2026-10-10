@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Literal
 import multiprocessing
 import numpy as np
@@ -46,6 +46,13 @@ class ForecastResult:
     # results table that mixes the two is unreadable after the fact, and
     # because the GARCH family ignores it entirely (no regression target),
     # so only some rows of a joint table are affected by it at all.
+    meta: dict = field(default_factory=dict)
+    # Facts about how the forecasts were produced, filled by RollingEvaluator:
+    # n_refits, and for the ML models the tuning cadence, the number of
+    # searches actually run, and the hyperparameters of the last fit. It is
+    # carried on the result because under evaluate_many(n_jobs != 1) the model
+    # objects live and die inside worker processes; the result is the only
+    # thing that comes back.
 
     @property
     def errors(self) -> pd.Series:
@@ -64,6 +71,43 @@ class ForecastResult:
             name=loss,
         )
 
+    def with_actuals(self, actuals: pd.Series, proxy: str | None = None) -> "ForecastResult":
+        """
+        Same forecasts, scored against a different proxy.
+
+        For robustness checks of the yardstick (e.g. the r^2 column): the
+        models are not refitted, only the realized series they are compared
+        with changes. Raises if `actuals` misses any forecast date.
+        """
+        a = actuals.reindex(self.forecasts.index)
+        if a.isna().any():
+            raise ValueError(
+                f"[{self.name}] new actuals miss {int(a.isna().sum())} of "
+                f"{len(a)} forecast dates; pass a proxy covering the test period."
+            )
+        return replace(
+            self,
+            actuals=a.astype(float),
+            proxy=proxy or actuals.name or "custom",
+            meta=dict(self.meta),
+        )
+
+    def drop_dates(self, dates) -> "ForecastResult":
+        """
+        The same evaluation without the given dates, e.g. contract-roll days.
+
+        Forecasts are NOT recomputed: this scores the existing run on a subset
+        of days. Comparing it with a run on data from which those days were
+        removed separates "different days scored" from "different data
+        estimated on". `refit_indices` keep referring to the full run.
+        """
+        idx = self.forecasts.index
+        keep = ~idx.isin(_coerce_dates(dates, idx))
+        meta = dict(self.meta)
+        meta["dates_dropped"] = int((~keep).sum())
+        return replace(self, forecasts=self.forecasts[keep],
+                       actuals=self.actuals[keep], meta=meta)
+
     def __repr__(self) -> str:
         m = self.metrics()
         target_note = (
@@ -74,6 +118,32 @@ class ForecastResult:
             f"ForecastResult(name={self.name!r}, n={len(self.forecasts)}, "
             f"proxy={self.proxy!r}{target_note}, RMSE={m['RMSE']:.6e})"
         )
+
+
+def _coerce_dates(dates, like: pd.Index) -> pd.Index:
+    """Express `dates` in the index type of `like` (PeriodIndex or DatetimeIndex)."""
+    if isinstance(like, pd.PeriodIndex):
+        if isinstance(dates, pd.PeriodIndex):
+            return dates.asfreq(like.freq)
+        return pd.PeriodIndex(pd.DatetimeIndex(dates), freq=like.freq)
+    if isinstance(dates, pd.PeriodIndex):
+        return dates.to_timestamp()
+    return pd.DatetimeIndex(dates)
+
+
+def _run_meta(model, n_refits: int) -> dict:
+    """What a fitted model can tell about how it was produced."""
+    meta: dict = {"n_refits": n_refits}
+    tune = getattr(model, "tune", None)
+    if tune is not None:
+        meta["tune"] = tune
+    cache = getattr(model, "tuning_cache", None)
+    if cache is not None:
+        meta["n_searches"] = cache.n_searches
+    hp = getattr(model, "hyperparameters", None)
+    if callable(hp):
+        meta["hyperparameters"] = hp()
+    return meta
 
 
 class RollingEvaluator:
@@ -272,6 +342,7 @@ class RollingEvaluator:
             refit_indices=refit_indices,
             proxy=proxy_name,
             train_target=train_target_name,
+            meta=_run_meta(model, len(refit_indices)),
         )
 
     def evaluate_many(

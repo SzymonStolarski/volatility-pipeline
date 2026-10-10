@@ -40,11 +40,22 @@ Layer 4 — `residual_report` / `residual_diagnostics_table`: the same battery
 Layer 4 on one fitted model; `residual_diagnostics_table` summarises Layer 4
 across a whole set of them. All return notebook-ready tables.
 
+MAIN AND SUPPLEMENTARY TESTS (article specification, October 2026). On the
+returns, Bai-Ng is the main (descriptive) test. On the residuals, the main
+battery is variance-equation adequacy (Ljung-Box on z and z^2, ARCH-LM) and
+the PIT test of each model's own distribution, decided by Anderson-Darling
+with a Monte Carlo p-value (`anderson_darling_uniform_test`). The
+Kolmogorov-Smirnov tests and the Normal-null battery on the residuals are kept
+as SUPPLEMENTARY output: tables carry a `role` column, and
+`residual_diagnostics_table` lists its main and supplementary columns in
+`.attrs`.
+
 Dependencies: statsmodels (Ljung-Box, ARCH-LM), scipy (KS, Anderson-Darling).
 """
 from __future__ import annotations
 
 import warnings
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -362,23 +373,26 @@ def normality_report(
     bn = bai_ng_normality(returns, hac_lags=hac_lags)
     ks = ks_block_bootstrap(returns, n_boot=n_boot, block_size=block_size, seed=seed)
 
+    # Bai-Ng is the main (descriptive) normality test on returns; Jarque-Bera,
+    # KS and Anderson-Darling are kept as supplementary rows.
     norm_rows = [
-        {"test": "Jarque-Bera", "assumption": "i.i.d. (invalid here)",
-         "statistic": bn["jarque_bera_stat"], "p_value": bn["jarque_bera_pval"]},
-        {"test": "Bai-Ng joint (HAC)", "assumption": "dependence-robust",
+        {"role": "main", "test": "Bai-Ng joint (HAC)", "assumption": "dependence-robust",
          "statistic": bn["bai_ng_joint_stat"], "p_value": bn["bai_ng_joint_pval"]},
-        {"test": "Bai-Ng skewness (HAC)", "assumption": "dependence-robust",
+        {"role": "main", "test": "Bai-Ng skewness (HAC)", "assumption": "dependence-robust",
          "statistic": bn["bai_ng_skew_stat"], "p_value": bn["bai_ng_skew_pval"]},
-        {"test": "Bai-Ng kurtosis (HAC)", "assumption": "dependence-robust",
+        {"role": "main", "test": "Bai-Ng kurtosis (HAC)", "assumption": "dependence-robust",
          "statistic": bn["bai_ng_kurt_stat"], "p_value": bn["bai_ng_kurt_pval"]},
-        {"test": "KS vs Normal", "assumption": "i.i.d. (invalid here)",
+        {"role": "supplementary", "test": "Jarque-Bera", "assumption": "i.i.d. (invalid here)",
+         "statistic": bn["jarque_bera_stat"], "p_value": bn["jarque_bera_pval"]},
+        {"role": "supplementary", "test": "KS vs Normal", "assumption": "i.i.d. (invalid here)",
          "statistic": ks["ks_stat"], "p_value": ks["ks_pval_iid"]},
-        {"test": "KS vs Normal (block-bootstrap)", "assumption": "dependence-robust",
+        {"role": "supplementary", "test": "KS vs Normal (block-bootstrap)", "assumption": "dependence-robust",
          "statistic": ks["ks_stat"], "p_value": ks["ks_pval_block_boot"]},
-        {"test": "Anderson-Darling", "assumption": f"i.i.d.; crit@5%={ks['ad_crit_5pct']:.3f}",
+        {"role": "supplementary", "test": "Anderson-Darling",
+         "assumption": f"i.i.d.; crit@5%={ks['ad_crit_5pct']:.3f}",
          "statistic": ks["ad_stat"], "p_value": np.nan},
     ]
-    normality = pd.DataFrame(norm_rows, columns=["test", "assumption", "statistic", "p_value"])
+    normality = pd.DataFrame(norm_rows, columns=["role", "test", "assumption", "statistic", "p_value"])
     normality.insert(0, "series", name)
 
     return {"dependence": dep, "normality": normality}
@@ -415,15 +429,15 @@ def normality_report(
 # should be no ARCH left in z_t).
 
 # Asymptotic Anderson-Darling critical value at 5% for a FULLY SPECIFIED
-# continuous null (Marsaglia & Marsaglia 2004). Using it for the PIT, whose
-# parameters are estimated, makes the test conservative: estimation shrinks the
-# null distribution of A^2, so the true 5% cut-off is below this one.
+# continuous null (Marsaglia & Marsaglia 2004). Kept for reference only: the PIT
+# verdict now uses the Monte Carlo p-value of `anderson_darling_uniform_test`,
+# whose simulated 5% cut-off for n = 3110 is 2.495.
 _AD_CRIT_5PCT_FULLY_SPECIFIED = 2.492
 
 
-def _anderson_darling_uniform(u: np.ndarray) -> float:
+def _anderson_darling_uniform_rows(U: np.ndarray) -> np.ndarray:
     """
-    Anderson-Darling statistic for the U(0, 1) null.
+    Anderson-Darling statistic for the U(0, 1) null, one per ROW of U.
 
     A^2 = -n - (1/n) * sum_i (2i-1) * [ln u_(i) + ln(1 - u_(n+1-i))]
 
@@ -431,15 +445,84 @@ def _anderson_darling_uniform(u: np.ndarray) -> float:
     a Normal-innovation fit on fat-tailed data produces standardized residuals
     far enough into the tail that the normal CDF saturates to exactly 0.0 or
     1.0 in double precision, which would send A^2 to infinity for what is in
-    fact the most informative observation.
+    fact the most informative observation. The Monte Carlo null below is built
+    with this same function, so the p-value is exact for the clipped statistic.
     """
-    u = np.sort(np.asarray(u, dtype=float))
-    n = u.size
+    U = np.sort(np.atleast_2d(np.asarray(U, dtype=float)), axis=1)
+    n = U.shape[1]
     eps = 1.0 / (4.0 * n)      # tighter than the smallest resolvable order stat
-    u = np.clip(u, eps, 1.0 - eps)
+    U = np.clip(U, eps, 1.0 - eps)
     i = np.arange(1, n + 1)
-    s = np.sum((2 * i - 1) * (np.log(u) + np.log1p(-u[::-1])))
-    return float(-n - s / n)
+    s = np.sum((2 * i - 1) * (np.log(U) + np.log1p(-U[:, ::-1])), axis=1)
+    return -n - s / n
+
+
+def _anderson_darling_uniform(u: np.ndarray) -> float:
+    """Anderson-Darling statistic of one sample against U(0, 1)."""
+    return float(_anderson_darling_uniform_rows(np.asarray(u, dtype=float)[None, :])[0])
+
+
+@lru_cache(maxsize=32)
+def _ad_uniform_null(n: int, n_mc: int, seed: int) -> np.ndarray:
+    """
+    Sorted Monte Carlo draws of A^2 for n i.i.d. U(0, 1) observations.
+
+    Depends only on (n, n_mc, seed), so it is computed once and shared by every
+    model fitted on the same window. Checked against the asymptotic critical
+    values of the fully specified case (1.933 / 2.492 / 3.857 at 10/5/1%):
+    the n = 3110 draws give 1.95 / 2.495 / 3.79.
+    """
+    rng = np.random.default_rng(seed)
+    out = np.empty(n_mc)
+    chunk = max(1, min(n_mc, 4_000_000 // max(n, 1)))
+    for start in range(0, n_mc, chunk):
+        stop = min(n_mc, start + chunk)
+        out[start:stop] = _anderson_darling_uniform_rows(rng.random((stop - start, n)))
+    out.sort()
+    return out
+
+
+def anderson_darling_uniform_test(u, n_mc: int = 10_000, seed: int = 20261001) -> dict:
+    """
+    The main PIT test: Anderson-Darling against U(0, 1), with a Monte Carlo
+    p-value.
+
+    Why Anderson-Darling. The innovation distribution is decided in the tails,
+    and A^2 weights departures there; KS is most sensitive near the median and
+    can miss a distribution that is wrong only in the tails. KS is kept as a
+    supplementary test (`uniformity_block_bootstrap`).
+
+    Why this reference distribution. Under correct specification of both the
+    variance equation and the innovation distribution, u_t = F(z_t; theta_hat)
+    is i.i.d. U(0, 1) (Diebold, Gunther & Tay 1998), so the null distribution
+    of A^2 is that of a fully specified uniform sample, simulated here. Serial
+    dependence is not part of this null; it is tested separately by the
+    Ljung-Box and ARCH-LM columns. The shape parameter of t is estimated, which
+    makes this reference slightly conservative (estimation shrinks the true
+    null distribution of A^2), so a rejection is if anything understated.
+
+    p_value = (1 + #{simulated A^2 >= observed}) / (n_mc + 1); its floor is
+    1 / (n_mc + 1).
+    """
+    u = _as_clean_series(u, min_obs=20, caller="anderson_darling_uniform_test").to_numpy()
+    u = u[np.isfinite(u)]
+    if not ((u >= 0.0).all() and (u <= 1.0).all()):
+        raise ValueError(
+            "anderson_darling_uniform_test expects probability-integral-transform "
+            "values in [0, 1]; pass model.pit(), not the residuals themselves."
+        )
+    n = int(u.size)
+    stat = _anderson_darling_uniform(u)
+    null = _ad_uniform_null(n, int(n_mc), int(seed))
+    n_ge = n_mc - int(np.searchsorted(null, stat, side="left"))
+    pval = (1 + n_ge) / (n_mc + 1)
+    return {
+        "n": n,
+        "ad_stat": float(stat),
+        "ad_pval": float(pval),
+        "ad_crit_5pct": float(np.quantile(null, 0.95)),
+        "n_mc": int(n_mc),
+    }
 
 
 def uniformity_block_bootstrap(
@@ -447,6 +530,7 @@ def uniformity_block_bootstrap(
     n_boot: int = 2000,
     block_size: int | None = None,
     seed: int | None = 42,
+    n_mc: int = 10_000,
 ) -> dict:
     """
     Test probability-integral-transform values for uniformity on (0, 1), with a
@@ -460,10 +544,11 @@ def uniformity_block_bootstrap(
     the same recentered stationary-bootstrap construction used by
     `ks_block_bootstrap`, is the one to report.
 
-    Anderson-Darling is included because it weights the tails, which is
-    precisely where a Normal innovation assumption fails and where the choice
-    between Normal, t and GED is decided; KS is most sensitive near the median
-    and can miss it.
+    Anderson-Darling is the MAIN verdict (see `anderson_darling_uniform_test`
+    for its p-value): it weights the tails, which is precisely where a Normal
+    innovation assumption fails and where the choice between Normal and t is
+    decided; KS is most sensitive near the median and can miss it. The KS
+    results are returned as supplementary evidence.
     """
     u = _as_clean_series(u, min_obs=20, caller="uniformity_block_bootstrap").to_numpy()
     u = u[np.isfinite(u)]
@@ -492,18 +577,20 @@ def uniformity_block_bootstrap(
         d_boot[b] = np.max(np.abs(f_b - f_orig))
 
     p_block = float((np.sum(d_boot >= d_obs) + 1) / (n_boot + 1))
-    ad_stat = _anderson_darling_uniform(u)
+    ad = anderson_darling_uniform_test(u, n_mc=n_mc)
 
     return {
         "n": int(T),
+        "ad_stat": ad["ad_stat"],
+        "ad_pval": ad["ad_pval"],
+        "ad_crit_5pct": ad["ad_crit_5pct"],
+        "ad_reject_5pct": bool(ad["ad_pval"] < 0.05),
+        "ad_n_mc": ad["n_mc"],
         "ks_stat": float(d_obs),
         "ks_pval_iid": float(p_iid),
         "ks_pval_block_boot": p_block,
         "block_size": int(block_size),
         "n_boot": int(n_boot),
-        "ad_stat": ad_stat,
-        "ad_crit_5pct": float(_AD_CRIT_5PCT_FULLY_SPECIFIED),
-        "ad_reject_5pct": bool(ad_stat > _AD_CRIT_5PCT_FULLY_SPECIFIED),
     }
 
 
@@ -549,10 +636,13 @@ def residual_report(
     adequacy = dependence_diagnostics(
         z, lb_lags=lb_lags, arch_lags=arch_lags, unit="std. residuals"
     )
+    adequacy.insert(0, "role", "main")
     adequacy.insert(0, "model", name)
 
     bn = bai_ng_normality(z, hac_lags=hac_lags)
     ks = ks_block_bootstrap(z, n_boot=n_boot, block_size=block_size, seed=seed)
+    # On the residuals the whole Normal-null battery is supplementary: the PIT
+    # below is the test that judges each model by its own distribution.
     normality = pd.DataFrame(
         [
             {"test": "Jarque-Bera", "assumption": "i.i.d.",
@@ -573,6 +663,7 @@ def residual_report(
         ],
         columns=["test", "assumption", "statistic", "p_value"],
     )
+    normality.insert(0, "role", "supplementary")
     normality.insert(0, "model", name)
 
     out = {"adequacy": adequacy, "normality": normality}
@@ -584,16 +675,17 @@ def residual_report(
         h0 = f"fitted {dist_label}" if dist_label else "fitted distribution"
         pit_tbl = pd.DataFrame(
             [
-                {"test": "KS vs Uniform(0,1)", "assumption": "i.i.d.",
-                 "statistic": uni["ks_stat"], "p_value": uni["ks_pval_iid"]},
-                {"test": "KS vs Uniform(0,1) (block-bootstrap)",
+                {"role": "main", "test": "Anderson-Darling vs Uniform(0,1)",
+                 "assumption": f"Monte Carlo p ({uni['ad_n_mc']} draws); "
+                               f"crit@5%={uni['ad_crit_5pct']:.3f}; conservative",
+                 "statistic": uni["ad_stat"], "p_value": uni["ad_pval"]},
+                {"role": "supplementary", "test": "KS vs Uniform(0,1) (block-bootstrap)",
                  "assumption": "dependence-robust",
                  "statistic": uni["ks_stat"], "p_value": uni["ks_pval_block_boot"]},
-                {"test": "Anderson-Darling vs Uniform(0,1)",
-                 "assumption": f"conservative; crit@5%={uni['ad_crit_5pct']:.3f}",
-                 "statistic": uni["ad_stat"], "p_value": np.nan},
+                {"role": "supplementary", "test": "KS vs Uniform(0,1)", "assumption": "i.i.d.",
+                 "statistic": uni["ks_stat"], "p_value": uni["ks_pval_iid"]},
             ],
-            columns=["test", "assumption", "statistic", "p_value"],
+            columns=["role", "test", "assumption", "statistic", "p_value"],
         )
         pit_tbl.insert(0, "H0", h0)
         pit_tbl.insert(0, "model", name)
@@ -623,17 +715,23 @@ def residual_diagnostics_table(
 
     Columns
     -------
-    dist, nu                  the fitted innovation distribution and its shape
-                              parameter (blank for Normal).
+    MAIN (listed in `.attrs["main_columns"]`):
+    dist, nu, n               the fitted innovation distribution, its shape
+                              parameter (blank for Normal) and the sample size.
+    LB(lag) p                 Ljung-Box on z_t: is the mean equation adequate?
     LB2(lag) p, ARCH-LM p     variance-equation adequacy. LARGE p is the good
                               outcome: no clustering left in z_t.
+    PIT AD, PIT AD p          is the model's OWN distribution adequate?
+                              Anderson-Darling on u_t = F(z_t), Monte Carlo
+                              p-value. LARGE p is the good outcome. NaN when the
+                              model does not expose .pit().
+
+    SUPPLEMENTARY (`.attrs["supplementary_columns"]`):
     skew, ex.kurt             shape of the standardized residuals.
     BaiNg p, KS-N p           is the NORMAL innovation assumption adequate?
                               SMALL p rejects it.
     AD-N                      Anderson-Darling against Normal (statistic).
-    PIT KS p, PIT AD          is the model's OWN distribution adequate?
-                              LARGE PIT p is the good outcome. NaN when the
-                              model does not expose .pit().
+    PIT KS p                  KS on u_t, block-bootstrap p-value.
 
     `n_boot` defaults lower than elsewhere in this module because two block
     bootstraps run per model; raise it for final numbers.
@@ -647,6 +745,7 @@ def residual_diagnostics_table(
         dep = dependence_diagnostics(
             z, lb_lags=(lag,), arch_lags=arch_lags, unit="std. residuals"
         )
+        lb_p = float(dep.loc[dep["test"] == "Ljung-Box (std. residuals)", "p_value"].iloc[0])
         lb2_p = float(dep.loc[dep["test"].str.startswith("Ljung-Box (squared"), "p_value"].iloc[0])
         arch_p = float(dep.loc[dep["test"] == "Engle ARCH-LM", "p_value"].iloc[0])
 
@@ -659,6 +758,7 @@ def residual_diagnostics_table(
             "dist": str(getattr(m, "dist", "")),
             "nu": float(next(iter(shape.values()))) if shape else np.nan,
             "n": T,
+            f"LB({lag}) p": lb_p,
             f"LB2({lag}) p": lb2_p,
             "ARCH-LM p": arch_p,
             "skew": bn["skewness"],
@@ -673,12 +773,17 @@ def residual_diagnostics_table(
             uni = uniformity_block_bootstrap(
                 pit_fn(), n_boot=n_boot, block_size=block_size, seed=seed
             )
-            row["PIT KS p"] = uni["ks_pval_block_boot"]
             row["PIT AD"] = uni["ad_stat"]
+            row["PIT AD p"] = uni["ad_pval"]
+            row["PIT KS p"] = uni["ks_pval_block_boot"]
         else:
-            row["PIT KS p"] = np.nan
-            row["PIT AD"] = np.nan
+            row["PIT AD"] = row["PIT AD p"] = row["PIT KS p"] = np.nan
 
         rows.append(row)
 
-    return pd.DataFrame(rows).set_index("model")
+    main = ["dist", "nu", "n", f"LB({lag}) p", f"LB2({lag}) p", "ARCH-LM p", "PIT AD", "PIT AD p"]
+    supplementary = ["skew", "ex.kurt", "BaiNg p", "KS-N p", "AD-N", "PIT KS p"]
+    out = pd.DataFrame(rows).set_index("model")[main + supplementary]
+    out.attrs["main_columns"] = main
+    out.attrs["supplementary_columns"] = supplementary
+    return out

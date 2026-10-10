@@ -7,7 +7,7 @@ import torch.nn as nn
 from sklearn.preprocessing import RobustScaler
 
 from .garch_models import GARCHModel
-from .tuning import TuningCache, resolve_hyperparameters, validate_tune
+from .tuning import TuningCache, chrono_split, resolve_hyperparameters, validate_tune
 from .targets import (
     _EPS,
     log_variance_target,
@@ -112,8 +112,8 @@ def _fit_network(
     torch.manual_seed(seed)
 
     n = len(X)
-    n_val = max(1, int(round(n * val_fraction)))
-    n_train = n - n_val
+    # Early-stopping tail: the LAST val_fraction of whatever the net is given.
+    n_train = chrono_split(n, val_frac=val_fraction)
 
     X_t = torch.from_numpy(X)
     y_t = torch.from_numpy(y)
@@ -274,7 +274,7 @@ def _optuna_tune_lstm(
             f"training budget. Set them on the model instead."
         )
 
-    split = int(len(X) * 0.8)
+    split = chrono_split(len(X), train_frac=0.8)   # earlier 80% trains, later 20% scores
     if split < 30 or len(X) - split < 10:
         raise ValueError(
             f"too little history to tune: {len(X)} training sequences leave no "
@@ -332,6 +332,11 @@ class _TunableLSTM:
 
     def _default_hp(self) -> dict:
         return {k: getattr(self, k) for k in LSTM_TUNABLE}
+
+    def hyperparameters(self) -> dict:
+        """Settings the last fit ran with (tuned or default), for reporting:
+        the searched ones, plus the fixed information set and training budget."""
+        return {k: getattr(self, k) for k in (*LSTM_TUNABLE, *LSTM_NOT_TUNABLE)}
 
     def _apply_hp(self, hp: dict) -> None:
         for k, v in hp.items():

@@ -149,6 +149,67 @@ def dm_matrix(
     return stat_df, pval_df
 
 
+def dm_vs_benchmark(
+    results: dict,
+    benchmark: str = "GARCH-NORMAL",
+    loss: str = "qlike",
+    h: int = 1,
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """
+    The single DM comparison the article reports: every model against one
+    benchmark, GARCH(1,1) with Normal errors by default (the winner of the
+    first version of the paper).
+
+    A full pairwise matrix grows quadratically (1,081 pairs for 47 models) and
+    carries no family-wise error control. Joint inference is the MCS's job; the
+    DM column answers the narrower, interpretable question "is this model
+    better or worse than the benchmark?".
+
+    Columns
+    -------
+    mean_loss  average loss of the model
+    loss_diff  mean_loss(model) - mean_loss(benchmark); NEGATIVE = model better
+    dm_stat    HLN-corrected DM statistic on d_t = L(model) - L(benchmark);
+               negative = model better
+    p_value    two-sided, from t(T-1)
+    verdict    'better' / 'worse' when p < alpha, else 'n.s.'
+
+    Caveat for the text: models that nest the benchmark (GARCH-T, GJR-GARCH-N
+    against GARCH-N) make the loss differential near-degenerate under H0, which
+    tends to oversize the test (Clark and McCracken). Read those rows with the
+    MCS alongside.
+    """
+    if benchmark not in results:
+        raise KeyError(f"benchmark {benchmark!r} not among the results: {sorted(results)}")
+    lb = results[benchmark].loss_series(loss)
+    rows = []
+    for name, res in results.items():
+        if name == benchmark:
+            continue
+        lm = res.loss_series(loss)
+        if not lm.index.equals(lb.index):
+            raise ValueError(
+                f"{name!r} and the benchmark were evaluated on different dates; "
+                f"DM needs paired losses."
+            )
+        stat, pval = diebold_mariano_from_losses(lm.values, lb.values, h=h)
+        verdict = "n.s." if pval >= alpha else ("better" if stat < 0 else "worse")
+        rows.append({
+            "model": name,
+            "mean_loss": float(lm.mean()),
+            "loss_diff": float(lm.mean() - lb.mean()),
+            "dm_stat": stat,
+            "p_value": pval,
+            "verdict": verdict,
+        })
+    out = pd.DataFrame(rows, columns=["model", "mean_loss", "loss_diff", "dm_stat",
+                                      "p_value", "verdict"]).set_index("model")
+    out.attrs.update(benchmark=benchmark, loss=loss, alpha=alpha,
+                     benchmark_mean_loss=float(lb.mean()))
+    return out
+
+
 def _family_of(name: str) -> str:
     """Model family = name with the trailing '-DIST' suffix removed.
 

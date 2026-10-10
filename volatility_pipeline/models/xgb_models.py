@@ -5,7 +5,7 @@ import xgboost as xgb
 
 from .garch_models import GARCHModel
 from .targets import log_variance_target, resolve_target, smearing_factor
-from .tuning import TuningCache, resolve_hyperparameters, validate_tune
+from .tuning import TuningCache, chrono_split, resolve_hyperparameters, validate_tune
 
 
 _DEFAULT_XGB_PARAMS: dict = {
@@ -50,7 +50,7 @@ def _optuna_tune(
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    split = int(len(X) * 0.8)
+    split = chrono_split(len(X), train_frac=0.8)   # earlier 80% fit, later 20% scored
     X_tr, X_val = X[:split], X[split:]
     y_tr, y_val = y[:split], y[split:]
 
@@ -81,6 +81,18 @@ def _optuna_tune(
     best = study.best_params
     best["objective"] = "reg:squarederror"
     return best
+
+
+_HP_NOISE = ("verbosity", "n_jobs", "objective", "random_state")
+
+
+def _xgb_hyperparameters(model) -> dict:
+    """Booster settings used by the last fit, plus the fixed information set."""
+    if model._params is None:
+        raise RuntimeError("Call .fit() first.")
+    hp = {k: v for k, v in model._params.items() if k not in _HP_NOISE}
+    hp.update(n_lags=model.n_lags, use_returns=model.use_returns)
+    return hp
 
 
 class XGBVolatilityModel:
@@ -128,6 +140,7 @@ class XGBVolatilityModel:
         self.retransform    = retransform
         self.target_floor_q = target_floor_q
         self._model: xgb.XGBRegressor | None = None
+        self._params: dict | None = None
         self._last_sq: np.ndarray | None = None
         self._last_r:  np.ndarray | None = None
         self._smearing: float = 1.0
@@ -148,6 +161,7 @@ class XGBVolatilityModel:
             lambda: _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs),
             {**self.xgb_params, "random_state": self.seed, "verbosity": 0},
         )
+        self._params = dict(params)
         self._model = xgb.XGBRegressor(**params)
         self._model.fit(X, y)
         self._smearing = (
@@ -188,6 +202,10 @@ class XGBVolatilityModel:
         if self.use_returns:
             names += [f"r_lag{i + 1}" for i in range(self.n_lags)]
         return names
+
+    def hyperparameters(self) -> dict:
+        """Settings the last fit ran with (tuned or default), for reporting."""
+        return _xgb_hyperparameters(self)
 
     def _build_features(
         self, sq: np.ndarray, r: np.ndarray, y_raw: np.ndarray
@@ -271,6 +289,7 @@ class XGBHybridModel:
         self.target_floor_q   = target_floor_q
         self._garch: GARCHModel | None       = None
         self._xgb: xgb.XGBRegressor | None  = None
+        self._params: dict | None            = None
         self._last_sq: np.ndarray | None     = None
         self._last_r:  np.ndarray | None     = None
         self._smearing: float                = 1.0
@@ -315,6 +334,7 @@ class XGBHybridModel:
             lambda: _optuna_tune(X, y, self.n_trials, self.seed, self.optuna_n_jobs),
             {**self.xgb_params, "random_state": self.seed, "verbosity": 0},
         )
+        self._params = dict(params)
         self._xgb = xgb.XGBRegressor(**params)
         self._xgb.fit(X, y)
         self._smearing = (
@@ -366,6 +386,10 @@ class XGBHybridModel:
             names += [f"r_lag{i + 1}" for i in range(self.n_lags)]
         names.append("garch_fc")
         return names
+
+    def hyperparameters(self) -> dict:
+        """Settings the last fit ran with (tuned or default), for reporting."""
+        return _xgb_hyperparameters(self)
 
     def __repr__(self) -> str:
         return (

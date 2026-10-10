@@ -36,6 +36,45 @@ from typing import Callable
 TUNE_MODES = ("never", "first", "always")
 
 
+def chrono_split(
+    n: int,
+    *,
+    train_frac: float | None = None,
+    val_frac: float | None = None,
+) -> int:
+    """
+    Split point k for n time-ordered rows: rows [0, k) are the EARLIER block
+    used for fitting, rows [k, n) the LATER block used for validation. Nothing
+    is ever shuffled, so validation data always post-date the data a candidate
+    was trained on.
+
+    Every split in the ML tuning path goes through here, so one tested function
+    answers "is the Optuna hold-out chronological?" for all of them:
+
+      train_frac=0.8  the hyperparameter hold-outs of both the XGBoost and the
+                      LSTM search: k = int(n * train_frac)
+      val_frac        the LSTM's early-stopping tail inside whatever it is
+                      trained on: k = n - max(1, round(n * val_frac))
+
+    For the LSTM the two are NESTED: a trial trains on the first 80% of the
+    window, its early stopping takes the last `val_frac` of those 80%, and the
+    trial is scored on the final 20%, which it has neither trained nor stopped
+    on.
+    """
+    if (train_frac is None) == (val_frac is None):
+        raise ValueError("pass exactly one of train_frac or val_frac.")
+    frac = train_frac if train_frac is not None else val_frac
+    if not 0.0 < frac < 1.0:
+        raise ValueError(f"split fraction must lie in (0, 1), got {frac!r}.")
+    if train_frac is not None:
+        k = int(n * train_frac)
+    else:
+        k = n - max(1, int(round(n * val_frac)))
+    if not 0 < k < n:
+        raise ValueError(f"cannot split {n} rows into two non-empty chronological blocks.")
+    return k
+
+
 def validate_tune(tune: str) -> str:
     if tune not in TUNE_MODES:
         raise ValueError(f"tune must be one of {list(TUNE_MODES)}, got {tune!r}.")
