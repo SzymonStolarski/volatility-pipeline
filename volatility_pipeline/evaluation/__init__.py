@@ -29,4 +29,4 @@ from .normality import (
     residual_report,
     residual_diagnostics_table,
 )
-from .reporting import rescore, exclude_dates, hyperparameter_table
+from .reporting import rescore, exclude_dates, hyperparameter_table, equal_weight_combination

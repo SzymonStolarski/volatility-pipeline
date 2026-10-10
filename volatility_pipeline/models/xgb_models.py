@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from .garch_models import GARCHModel
+from .garch_models import GARCHInputs, GARCHModel
 from .targets import log_variance_target, resolve_target, smearing_factor
 from .tuning import TuningCache, chrono_split, resolve_hyperparameters, validate_tune
 
@@ -227,21 +227,63 @@ class XGBVolatilityModel:
         )
 
 
+def _hybrid_design(
+    sq: np.ndarray,
+    r: np.ndarray,
+    g_vars: np.ndarray,
+    y_raw: np.ndarray,
+    n_lags: int,
+    use_returns: bool,
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Training rows of the XGBoost hybrid / combiner.
+
+    Row for predicting day i+1 (i = n_lags .. n-2):
+      [r^2_i .. r^2_{i-n_lags+1}]  [r_i .. r_{i-n_lags+1}]  [h^(1)_{i+1|i} .. h^(K)_{i+1|i}]
+    g_vars[t, k] = h^(k)_{t|t-1} is specification k's in-sample conditional
+    variance, so g_vars[i+1] is known at the end of day i: the GARCH state for
+    day i+1 is filtered from returns up to i. Target: y_raw[i+1] ('features'),
+    or y_raw[i+1] - h^(1)_{i+1|i} ('residual', single specification only).
+    """
+    rows, targets = [], []
+    for i in range(n_lags, len(sq) - 1):
+        row = list(sq[i - n_lags + 1 : i + 1][::-1])
+        if use_returns:
+            row += list(r[i - n_lags + 1 : i + 1][::-1])
+        row += list(g_vars[i + 1])
+        rows.append(row)
+        targets.append(y_raw[i + 1] if mode == "features" else y_raw[i + 1] - g_vars[i + 1, 0])
+    return np.array(rows, dtype=float), np.array(targets, dtype=float)
+
+
 class XGBHybridModel:
     """
     Hybrid XGBoost + GARCH volatility model. Compatible with RollingEvaluator.
 
     mode='features':
-        XGB predicts variance directly, using the GARCH one-step-ahead forecast
-        (h_{t+1|t}) and lagged returns as features.  Final forecast = XGB output.
+        XGB predicts variance directly from lagged returns and squared returns
+        plus the one-step-ahead forecast(s) of the GARCH specification(s) in
+        `garch_specs`. Final forecast = XGB output.
+          * one specification  -> the single-base hybrid
+          * the GARCH family   -> the COMBINER: XGBoost as a nonlinear combiner
+                                  of the family's one-step forecasts (the
+                                  article's hybrid, specification of Oct 2026).
 
-    mode='residual':
-        XGB predicts the GARCH residual: realized_var − GARCH_forecast.
+    mode='residual' (one specification only):
+        XGB predicts the GARCH residual: realized_var - GARCH_forecast.
         Final forecast = GARCH_forecast + XGB_residual_correction.
 
-    In both modes the internal GARCH model is re-estimated on every .fit() call,
-    so the hybrid model is self-contained and works transparently with
-    RollingEvaluator's expanding/sliding window refitting logic.
+    Training uses each specification's IN-SAMPLE conditional variance
+    h_{t+1|t} (parameters estimated on the training window); forecasting uses
+    its genuine one-step forecast after update(). See GARCHInputs.
+
+    The GARCH models are re-estimated on every .fit() call, so the model is
+    self-contained and works transparently with RollingEvaluator's expanding /
+    sliding refitting.
+
+    `garch_specs=None` keeps the single-base signature (garch_model_type,
+    garch_dist); `asym_order` reaches EGARCH / APARCH as in make_garch.
     """
 
     def __init__(
@@ -262,6 +304,8 @@ class XGBHybridModel:
         log_target: bool = True,
         retransform: str = "smearing",
         target_floor_q: float = 0.01,
+        garch_specs: list | None = None,
+        asym_order: int | None = None,
     ) -> None:
         if mode not in ("features", "residual"):
             raise ValueError(f"mode must be 'features' or 'residual', got {mode!r}")
@@ -269,10 +313,18 @@ class XGBHybridModel:
             raise ValueError(
                 f"retransform must be 'smearing' or 'none', got {retransform!r}"
             )
-        self.garch_model_type = garch_model_type
-        self.garch_dist       = garch_dist
+        self.garch_specs      = GARCHInputs(
+            garch_specs if garch_specs is not None else [(garch_model_type, garch_dist)]
+        ).specs
+        if mode == "residual" and len(self.garch_specs) != 1:
+            raise ValueError(
+                "mode='residual' needs exactly one GARCH specification: the residual "
+                f"is measured against one base forecast; got {len(self.garch_specs)}."
+            )
+        self.garch_model_type, self.garch_dist = self.garch_specs[0]
         self.garch_p          = garch_p
         self.garch_q          = garch_q
+        self.asym_order       = asym_order
         self.mode             = mode
         self.n_lags           = n_lags
         self.use_returns      = use_returns
@@ -287,12 +339,21 @@ class XGBHybridModel:
         self.log_target       = bool(log_target) and mode == "features"
         self.retransform      = retransform
         self.target_floor_q   = target_floor_q
-        self._garch: GARCHModel | None       = None
+        self._inputs: GARCHInputs | None     = None
         self._xgb: xgb.XGBRegressor | None  = None
         self._params: dict | None            = None
         self._last_sq: np.ndarray | None     = None
         self._last_r:  np.ndarray | None     = None
         self._smearing: float                = 1.0
+
+    @property
+    def is_combiner(self) -> bool:
+        return len(self.garch_specs) > 1
+
+    @property
+    def _garch(self) -> GARCHModel | None:
+        """The (first) internal GARCH model — the base of a single-base hybrid."""
+        return self._inputs.models[0] if self._inputs is not None else None
 
     def fit(self, returns: pd.Series, target: pd.Series | None = None) -> "XGBHybridModel":
         """
@@ -301,31 +362,13 @@ class XGBHybridModel:
         """
         r  = np.asarray(returns, dtype=float)
         sq = r ** 2
-        n  = len(r)
         y_raw = resolve_target(r, None if target is None else np.asarray(target, dtype=float))
 
-        self._garch = GARCHModel(
-            self.garch_model_type, self.garch_dist, self.garch_p, self.garch_q
-        )
-        self._garch.fit(returns)
-        # g_var[t] = h_{t|t-1}: GARCH in-sample conditional variance at each t
-        g_var = self._garch.insample_variance().values
-
-        rows, targets = [], []
-        for i in range(self.n_lags, n - 1):
-            # predicting y_raw[i+1]; use g_var[i+1] = h_{i+1|i} as GARCH feature
-            row = list(sq[i - self.n_lags + 1 : i + 1][::-1])
-            if self.use_returns:
-                row += list(r[i - self.n_lags + 1 : i + 1][::-1])
-            row.append(g_var[i + 1])
-            rows.append(row)
-            targets.append(
-                y_raw[i + 1] if self.mode == "features"
-                else y_raw[i + 1] - g_var[i + 1]
-            )
-
-        X = np.array(rows, dtype=float)
-        y = np.array(targets, dtype=float)
+        self._inputs = GARCHInputs(
+            self.garch_specs, p=self.garch_p, q=self.garch_q, asym_order=self.asym_order
+        ).fit(returns)
+        X, y = _hybrid_design(sq, r, self._inputs.insample_matrix(), y_raw,
+                              self.n_lags, self.use_returns, self.mode)
         if self.log_target:
             y = log_variance_target(y, self.target_floor_q)
 
@@ -347,29 +390,35 @@ class XGBHybridModel:
 
     def update(self, returns: pd.Series) -> "XGBHybridModel":
         """
-        Refresh the lagged features AND the GARCH state without refitting
-        either. The GARCH one-step forecast is an input feature, so leaving it
-        stale would defeat the point of updating the lags.
+        Refresh the lagged features AND every GARCH state without refitting.
+        The GARCH one-step forecasts are input features, so leaving them stale
+        would defeat the point of updating the lags.
         """
         r = np.asarray(returns, dtype=float)
         if len(r) < self.n_lags:
             raise ValueError(
                 f"update needs at least n_lags={self.n_lags} observations, got {len(r)}."
             )
-        if self._garch is not None:
-            self._garch.update(returns)
+        if self._inputs is not None:
+            self._inputs.update(returns)
         self._last_sq = (r ** 2)[-self.n_lags:].copy()
         self._last_r  = r[-self.n_lags:].copy()
         return self
 
-    def forecast_variance(self, horizon: int = 1) -> np.ndarray:
-        if self._xgb is None or self._garch is None:
+    def garch_forecasts(self) -> pd.Series:
+        """The one-step GARCH forecasts the next prediction will be fed."""
+        if self._inputs is None:
             raise RuntimeError("Call .fit() first.")
-        garch_fc = float(self._garch.forecast_variance(horizon=1)[0])
+        return pd.Series(self._inputs.forecasts(), index=self._inputs.names, name="garch_forecast")
+
+    def forecast_variance(self, horizon: int = 1) -> np.ndarray:
+        if self._xgb is None or self._inputs is None:
+            raise RuntimeError("Call .fit() first.")
+        garch_fc = self._inputs.forecasts()
         row = list(self._last_sq[::-1])
         if self.use_returns:
             row += list(self._last_r[::-1])
-        row.append(garch_fc)
+        row += list(garch_fc)
         xgb_pred = float(self._xgb.predict(np.array([row]))[0])
         if self.mode == "features":
             result = (
@@ -377,22 +426,31 @@ class XGBHybridModel:
                 else max(xgb_pred, 1e-10)
             )
         else:
-            result = max(garch_fc + xgb_pred, 1e-10)
+            result = max(float(garch_fc[0]) + xgb_pred, 1e-10)
         return np.full(horizon, result)
 
     def feature_names(self) -> list[str]:
         names = [f"sq_lag{i + 1}" for i in range(self.n_lags)]
         if self.use_returns:
             names += [f"r_lag{i + 1}" for i in range(self.n_lags)]
-        names.append("garch_fc")
+        if self.is_combiner:
+            names += [f"fc_{t}-{d.upper()}" for t, d in self.garch_specs]
+        else:
+            names.append("garch_fc")
         return names
 
     def hyperparameters(self) -> dict:
         """Settings the last fit ran with (tuned or default), for reporting."""
-        return _xgb_hyperparameters(self)
+        hp = _xgb_hyperparameters(self)
+        hp["garch_inputs"] = len(self.garch_specs)
+        return hp
 
     def __repr__(self) -> str:
+        base = (
+            f"combiner of {len(self.garch_specs)} GARCH specs" if self.is_combiner
+            else f"garch={self.garch_model_type}-{self.garch_dist}"
+        )
         return (
-            f"XGBHybridModel(garch={self.garch_model_type}-{self.garch_dist}, "
-            f"mode={self.mode!r}, n_lags={self.n_lags}, tune={self.tune!r})"
+            f"XGBHybridModel({base}, mode={self.mode!r}, "
+            f"n_lags={self.n_lags}, tune={self.tune!r})"
         )

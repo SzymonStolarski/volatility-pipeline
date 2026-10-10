@@ -1,4 +1,4 @@
-from .garch_models import GARCHModel, make_garch
+from .garch_models import GARCHModel, GARCHInputs, make_garch
 # ORDER MATTERS: xgb_models (xgboost) must be imported before lstm_models
 # (torch). On macOS both wheels bundle their own libomp, and once torch's copy
 # is loaded first every XGBoost fit in the process crashes (OMP error #179 /

@@ -341,3 +341,102 @@ def make_garch(
     if asym_order is not None and model_type in _ASYM_CONFIGURABLE:
         kwargs["o"] = asym_order
     return GARCHModel(model_type, dist, **kwargs)
+
+
+def resolve_garch_specs(
+    garch_specs,
+    garch_model_type: str = "GARCH",
+    garch_dist: str = "normal",
+) -> list[tuple[str, str]]:
+    """
+    The (model_type, dist) pairs feeding a hybrid. `garch_specs=None` keeps the
+    single-base behaviour: one pair built from garch_model_type / garch_dist.
+    """
+    specs = [(garch_model_type, garch_dist)] if garch_specs is None else [tuple(s) for s in garch_specs]
+    if not specs:
+        raise ValueError("garch_specs must name at least one (model_type, dist) pair.")
+    for spec in specs:
+        if len(spec) != 2 or spec[0] not in _ARCH_VOL or spec[1] not in _ARCH_DIST:
+            raise ValueError(
+                f"invalid GARCH spec {spec!r}: expected (model_type, dist) with model_type "
+                f"in {list(_ARCH_VOL)} and dist in {list(_ARCH_DIST)}."
+            )
+    if len(set(specs)) != len(specs):
+        raise ValueError(f"garch_specs contains duplicates: {specs}")
+    return specs
+
+
+class GARCHInputs:
+    """
+    The GARCH specifications whose one-step variance forecasts are inputs to a
+    hybrid model: one specification for the single-base hybrids, the whole
+    family for the combiner.
+
+    What the hybrid learns from and what it is fed are deliberately different
+    objects, and this class provides both:
+
+    TRAINING   insample_matrix(): for every specification, the in-sample
+               conditional variance h_{t|t-1}, filtered with parameters
+               estimated on the training window passed to fit(). The state at t
+               uses returns up to t-1 only; the parameters have seen the whole
+               training window but nothing after it, so no test-period
+               information enters.
+    FORECAST   forecasts(): each specification's genuine one-step forecast
+               h_{t+1|t} after update(), i.e. exactly what the same GARCH model
+               reports in the evaluation when it is re-estimated on the same
+               window.
+
+    Each model is built with make_garch, so `asym_order` reaches EGARCH and
+    APARCH exactly as it does in the notebooks' GARCH section.
+    """
+
+    def __init__(
+        self,
+        specs,
+        p: int = 1,
+        q: int = 1,
+        asym_order: int | None = None,
+    ) -> None:
+        self.specs = resolve_garch_specs(specs)
+        self.p = p
+        self.q = q
+        self.asym_order = asym_order
+        self.models: list[GARCHModel] = []
+
+    @property
+    def names(self) -> list[str]:
+        return [f"{t}-{d.upper()}" for t, d in self.specs]
+
+    def fit(self, returns: pd.Series) -> "GARCHInputs":
+        self.models = [
+            make_garch(t, d, asym_order=self.asym_order, p=self.p, q=self.q).fit(returns)
+            for t, d in self.specs
+        ]
+        return self
+
+    def insample_matrix(self) -> np.ndarray:
+        """(n, K) in-sample conditional variances, column k = specification k."""
+        self._require_fitted()
+        return np.column_stack([m.insample_variance().to_numpy(dtype=float) for m in self.models])
+
+    def update(self, returns: pd.Series) -> "GARCHInputs":
+        """Advance every model's state to the end of `returns`, parameters fixed."""
+        self._require_fitted()
+        for m in self.models:
+            m.update(returns)
+        return self
+
+    def forecasts(self) -> np.ndarray:
+        """(K,) one-step-ahead variance forecasts from the current state."""
+        self._require_fitted()
+        return np.array([float(m.forecast_variance(horizon=1)[0]) for m in self.models])
+
+    def _require_fitted(self) -> None:
+        if not self.models:
+            raise RuntimeError("GARCHInputs not fitted. Call .fit() first.")
+
+    def __len__(self) -> int:
+        return len(self.specs)
+
+    def __repr__(self) -> str:
+        return f"GARCHInputs({self.names}, asym_order={self.asym_order})"
