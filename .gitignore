@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── volatility_pipeline run artefacts ─────────────────────────────────────────
+# Data snapshots (DATA_SNAPSHOT) and exploratory exports (EXPORT_RESULTS) written
+# to the repository root. Yahoo Finance data is not ours to redistribute, so the
+# snapshots stay out of git by default; force-add them (git add -f) if the
+# repository is private and they should be versioned. Exports written into
+# experiments/<date>/ are not matched here and can be committed with the run.
+/data/
+/results/
