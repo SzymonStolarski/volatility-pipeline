@@ -11,9 +11,10 @@ of every folder.
   is pinned in `<repo>/data` with a SHA-256 checked on every load. Results
   export (`EXPORT_RESULTS`): forecasts, per-day losses, metrics and every table,
   plus `run_config.json` with all settings, the data hash, the git commit and
-  package versions. The notebook defaults are now the frozen specification;
-  every option it switches off is kept as a commented-out line or listed next
-  to its setting.
+  package versions, into one folder per run,
+  `<EXPORT_ROOT>/<TICKER>/<YYYY-MM-DD_HHMM>_<RUN_LABEL>`, so no run overwrites
+  another. The notebook defaults are now the frozen specification; every option
+  it switches off is kept as a commented-out line or listed next to its setting.
 - **#19 GARCH-family combiner.** `XGB-COMB` and `LSTM-COMB` receive the
   one-step forecasts of all GARCH specifications (training on in-sample
   conditional variances, forecasting on genuine one-step forecasts), with the

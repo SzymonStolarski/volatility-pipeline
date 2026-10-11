@@ -27,11 +27,13 @@ output folder set.
 2. **Notebooks.** Copy `Main_pipeline_xgb_lstm.ipynb` into
    `experiments/<date>/` twice, one copy per commodity, and in each copy set:
    ```python
-   TICKER     = "BZ=F"                                     # and "NG=F" in the other copy
-   EXPORT_DIR = f"experiments/<date>/results/{TICKER}"
+   TICKER      = "BZ=F"                          # and "NG=F" in the other copy
+   EXPORT_ROOT = "experiments/<date>/results"
    ```
-   Leave everything else as it is. Run the copies with the repository root as
-   the working directory, as for the earlier batches, since the
+   Leave everything else as it is, including `RUN_LABEL = "main"`. Each run
+   writes into its own folder, `experiments/<date>/results/<TICKER>/<YYYY-MM-DD_HHMM>_main/`,
+   timestamped when the config cell runs. Run the copies with the repository
+   root as the working directory, as for the earlier batches, since the
    `volatility_pipeline` import needs it. Snapshot and export paths are
    resolved against the repository root either way.
 3. **Data.** `DATA_SNAPSHOT = "auto"` reads the pinned download in `<repo>/data`.
@@ -47,15 +49,19 @@ output folder set.
    redistribute. Keep a private copy, or force-add the files (`git add -f`) if
    the repository is private.
 4. **Robustness runs for the supplement.** Each is one more copy, with one
-   setting changed:
-   - contract-roll days removed from the data: `ROLL_HANDLING = "drop"`;
-   - sliding estimation window: `WINDOW_TYPE = "sliding"`, `WINDOW_SIZE = 750`.
+   setting changed and its own label:
+   - contract-roll days removed from the data: `ROLL_HANDLING = "drop"`,
+     `RUN_LABEL = "roll-drop"`;
+   - sliding estimation window: `WINDOW_TYPE = "sliding"`, `WINDOW_SIZE = 750`,
+     `RUN_LABEL = "sliding750"`.
 
-   Scoring on r² and scoring without roll days need no separate run. Every
-   run reports them in its robustness table.
-5. **Commit** the notebooks together with their `results/` folders. Each
-   results folder contains `run_config.json` with all settings, the data hash,
-   the git commit and the package versions.
+   They land next to the main runs, e.g. `results/NG=F/2026-10-20_1340_roll-drop/`,
+   and cannot overwrite them. Scoring on r² and scoring without roll days need
+   no separate run. Every run reports them in its robustness table.
+5. **Commit** the notebooks together with their `results/` folders. Each run
+   folder contains `run_config.json` with all settings, the data hash, the git
+   commit and the package versions. If a run was repeated, keep only the
+   folder of the run that is reported, or note here why both are kept.
 
 ## The frozen specification and where it is set
 
