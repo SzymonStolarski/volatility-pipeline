@@ -6,13 +6,15 @@ the export so they can be rebuilt and checked without re-running the models.
 The tests stay offline: a fake downloader stands in for Yahoo and counts calls.
 """
 import json
+import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from volatility_pipeline.data import load_ohlc, describe_source, repo_root, resolve_repo_path
-from volatility_pipeline.evaluation import ForecastResult, collect_config, export_run
+from volatility_pipeline.evaluation import ForecastResult, collect_config, export_run, run_directory
 
 
 def _fake_ohlc(n=250, seed=0):
@@ -163,6 +165,26 @@ def test_export_refuses_unaligned_results(tmp_path, results):
         export_run(tmp_path, results)
     with pytest.raises(ValueError, match="empty"):
         export_run(tmp_path, {})
+
+
+def test_every_run_gets_its_own_folder(tmp_path, results):
+    assert run_directory("results", "NG=F", "main", stamp="2026-10-20_1432") == \
+        Path("results") / "NG=F" / "2026-10-20_1432_main"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}_\d{4}_main", run_directory("results", "NG=F", "main").name)
+    assert run_directory("r", "BZ=F", "sliding 750 / drop", stamp="s").name == "s_sliding-750-drop"
+    with pytest.raises(ValueError, match="RUN_LABEL"):
+        run_directory("r", "NG=F", " / ")
+    # the robustness run lands next to the main run and leaves it untouched
+    main = export_run(run_directory(tmp_path, "NG=F", "main", stamp="2026-10-20_0915"), results)
+    before = (main / "forecasts.csv").read_bytes()
+    drop = export_run(run_directory(tmp_path, "NG=F", "roll-drop", stamp="2026-10-20_1340"), results)
+    assert main != drop and main.parent == drop.parent == tmp_path / "NG=F"
+    assert (main / "forecasts.csv").read_bytes() == before
+    # a run repeated within the same minute does not reuse the earlier folder
+    again = run_directory(tmp_path, "NG=F", "main", stamp="2026-10-20_0915")
+    assert again.name == "2026-10-20_0915_main-2"
+    export_run(again, results)
+    assert run_directory(tmp_path, "NG=F", "main", stamp="2026-10-20_0915").name == "2026-10-20_0915_main-3"
 
 
 def test_collect_config_keeps_plain_upper_case_settings():

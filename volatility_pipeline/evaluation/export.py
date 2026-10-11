@@ -16,6 +16,10 @@ checked) without re-running the models.
                        the git commit (and whether the tree had uncommitted
                        changes), package versions, and the list of files written
 
+`run_directory` names the folder: one per run,
+<root>/<ticker>/<YYYY-MM-DD_HHMM>_<label> (e.g. results/NG=F/2026-10-20_1432_main),
+so a later run (a robustness run, a repeat) never overwrites an earlier one.
+
 Relative directories are resolved against the repository root. Re-exporting
 into the same folder first removes the files the previous export listed in its
 run_config.json, so the folder never mixes two runs; files the export did not
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -57,6 +62,36 @@ def _jsonable(v):
 
 
 _SKIP = object()
+_UNSAFE_IN_FOLDER_NAME = re.compile(r"[^\w.-]+")
+
+
+def run_directory(root, ticker: str, label: str, stamp: str | None = None) -> Path:
+    """
+    The folder of one run: <root>/<ticker>/<stamp>_<label>, e.g.
+    results/NG=F/2026-10-20_1432_main.
+
+    `stamp` defaults to the current local time, YYYY-MM-DD_HHMM, so every run
+    gets its own folder. Call this once, in the notebook's config cell: the
+    whole notebook re-run makes a new folder, while re-running only the export
+    cell writes into the same one. `label` says what the run is ("main",
+    "roll-drop", "sliding750", ...); characters that do not belong in a folder
+    name become "-". A folder that already exists belongs to an earlier run
+    (this one has not exported yet), so a run repeated within the same minute
+    gets "-2", "-3", ... instead of replacing it. The path is returned as given
+    (a relative root stays relative); export_run resolves it against the
+    repository root.
+    """
+    name = _UNSAFE_IN_FOLDER_NAME.sub("-", str(label)).strip("-.")
+    if not name:
+        raise ValueError(f"RUN_LABEL {label!r} leaves nothing usable as a folder name.")
+    if stamp is None:
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    folder = Path(root) / ticker / f"{stamp}_{name}"
+    candidate, k = folder, 2
+    while resolve_repo_path(candidate).exists():
+        candidate = folder.with_name(f"{folder.name}-{k}")
+        k += 1
+    return candidate
 
 
 def collect_config(namespace: dict) -> dict:
